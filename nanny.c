@@ -32,23 +32,52 @@
 #include <pwd.h>
 
 void handler(int, siginfo_t *, void *);
+void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
+		 pid_t mp, pid_t pp, int cld);
+/* Data types */
+
+typedef struct msgq {
+  int signal_number;
+  const char *message;
+  time_t signal_time;
+  uid_t signal_uid;
+  pid_t signal_pid;
+  pid_t my_pid;
+  pid_t parent_pid;
+  int child_status;
+  struct msgq *tail;
+} msgq_t;
 
 /* Globals */
 
-#define HOSTLEN 1024;
+#define HOSTLEN 1024
+#define NSIGNALS 13
+#define PW_BUFSIZE 2048
 
 pid_t pid = -1;
-long hostid = -1L;
 char hostname[HOSTLEN];
+int ok = 1;
+msgq_t *msg_list = NULL;
+msgq_t *next_msg = NULL;
+int missed_msg = 0;
+const char *whoami = "nanny";
 
+const char *signal_strs[NSIGNALS] = {
+  "SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGALRM", "SIGTERM",
+  "SIGTSTP", "SIGCHLD", "SIGXCPU", "SIGXFSZ", "SIGPROF", "SIGUSR1", "SIGUSR2"
+};
+int trapped[NSIGNALS];
+int signals[NSIGNALS] = {
+  SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGALRM, SIGTERM,
+  SIGTSTP, SIGCHLD, SIGXCPU, SIGXFSZ, SIGPROF, SIGUSR1, SIGUSR2
+};
+  
 /* Main */
 
-int main(int argc, char **argv) {
+int main(int argc, char * const argv[]) {
   pid_t child_pid;
-  char *cmd;
-  int i;
-  size_t n;
   struct sigaction action;
+  int i;
 
   pid = getpid();
   if(gethostname(hostname, (size_t)HOSTLEN) == -1) {
@@ -60,80 +89,24 @@ int main(int argc, char **argv) {
   action.sa_sigaction = handler;
   action.sa_flags = SA_SIGINFO;
 
-  if(sigaction(SIGHUP, handler, NULL) == -1) {
-    perror("Trapping SIGHUP");
-    exit(1);
-  }
-  if(sigaction(SIGINT, handler, NULL) == -1) {
-    perror("Trapping SIGINT");
-    exit(1);
-  }
-  if(sigaction(SIGQUIT, handler, NULL) == -1) {
-    perror("Trapping SIGQUIT");
-    exit(1);
-  }
-  if(sigaction(SIGABRT, handler, NULL) == -1) {
-    perror("Trapping SIGABRT");
-    exit(1);
-  }
-  if(sigaction(SIGALRM, handler, NULL) == -1) {
-    perror("Trapping SIGALRM");
-    exit(1);
-  }
-  if(sigaction(SIGTERM, handler, NULL) == -1) {
-    perror("Trapping SIGTERM");
-    exit(1);
-  }
-  if(sigaction(SIGTSTP, handler, NULL) == -1) {
-    perror("Trapping SIGTSTP");
-    exit(1);
-  }
-  if(sigaction(SIGCHLD, handler, NULL) == -1) {
-    perror("Trapping SIGCHLD");
-    exit(1);
-  }
-  if(sigaction(SIGXCPU, handler, NULL) == -1) {
-    perror("Trapping SIGXCPU");
-    exit(1);
-  }
-  if(sigaction(SIGXFSZ, handler, NULL) == -1) {
-    perror("Trapping SIGXFSZ");
-    exit(1);
-  }
-  if(sigaction(SIGVTALRM, handler, NULL) == -1) {
-    perror("Trapping SIGVTALRM");
-    exit(1);
-  }
-  if(sigaction(SIGPROF, handler, NULL) == -1) {
-    perror("Trapping SIGPROF");
-    exit(1);
-  }
-  if(sigaction(SIGUSR1, handler, NULL) == -1) {
-    perror("Trapping SIGUSR1");
-    exit(1);
-  }
-  if(sigaction(SIGUSR2, handler, NULL) == -1) {
-    perror("Trapping SIGUSR2");
-    exit(1);
+  for(i = 0; i < NSIGNALS; i++) {
+    if(sigaction(signals[i], handler, NULL) == -1) {
+      trapped[i] = 0;
+    }
+    else {
+      trapped[i] = 1;
+    }
   }
 
-  n = (size_t)0;
-  for(i = 0; i < argc; i++) {
-    n += strlen(argv[i]) + 1;
-  }
-  cmd = (char *)calloc(n + 1, sizeof(char));
-
-  for(i = 0; i < argc; i++) {
-    strcat(cmd, argv[i]);
-    strcat(cmd, " ");
-  }
 
   child_pid = fork();
   if(child_pid == 0) {
     /* child */
-    hostid = gethostid();
-    system(cmd);
-    exit(0);
+    whoami = "child";
+    pid = getpid();
+    execvp(argv[0], argv);
+    perror("execvp failed");
+    exit(1);
   }
   else if(child_pid == -1) {
     /* error */
@@ -142,31 +115,125 @@ int main(int argc, char **argv) {
   }
   else {
     /* parent */
-    
+    int status;
+    whoami = "parent";
+    do {
+      switch(waitpid(child_pid, &status, WUNTRACED)) {
+      case 0:
+	sleep(1);
+	break;
+      case -1:
+	perror("waitpid failed");
+	exit(1);
+      default:
+      }
+    } while(ok);
   }
 }
 
-/*      _exit(), access(), alarm(), cfgetispeed(), cfgetospeed(), cfsetispeed(), cfsetospeed(), chdir(),
-     chmod(), chown(), close(), creat(), dup(), dup2(), execle(), execve(), fcntl(), fork(),
-     fpathconf(), fstat(), fsync(), getegid(), geteuid(), getgid(), getgroups(), getpgrp(), getpid(),
-     getppid(), getuid(), kill(), link(), lseek(), mkdir(), mkfifo(), open(), pathconf(), pause(),
-     pipe(), raise(), read(), rename(), rmdir(), setgid(), setpgid(), setsid(), setuid(),
-     sigaction(), sigaddset(), sigdelset(), sigemptyset(), sigfillset(), sigismember(), signal(),
-     sigpending(), sigprocmask(), sigsuspend(), sleep(), stat(), sysconf(), tcdrain(), tcflow(),
-     tcflush(), tcgetattr(), tcgetpgrp(), tcsendbreak(), tcsetattr(), tcsetpgrp(), time(), times(),
-     umask(), uname(), unlink(), utime(), wait(), waitpid(), write(). */
+int print_message(FILE *fp) {
+  if(fp == NULL) {
+    fp = stdout;
+  }
+  if(msg_list != NULL) {
+    struct tm tim;
+    int i;
+    msgq_t tail;
+    
+    if(gmtime_r(msg_list->signal_time, &tim) != NULL) {
+      fprintf(fp, "%04d%02d%02dT%02d%02d%02d ", tim.tm_year + 1900,
+	      tim.tm_mon + 1, tim.tm_mday, tim.tm_hour, tim.tm_min, tim.tm_sec);
+    }
+    else {
+      fprintf(fp, "........T...... ");
+    }
+    fprintf(fp, "nanny (%s %d | %d)@%s: ", whoami, (int)msg_list->my_id,
+	    (int)msg_list->parent_pid, hostname);
+    for(i = 0; i < NSIGNALS; i++) {
+      if(signals[i] == msg_list->signal_number) {
+	fprintf(fp, "%s (%d) caught ", signal_strs[i], signals[i]);
+      }
+    }
+    if(i == NSIGNALS) {
+      fprintf(fp, "unknown signal (%d) caught ", msg_list->signal_number);
+    }
+    if(msg_list->signal_uid > (uid_t)0) {
+      struct passwd pw, *result = NULL;
+      char buf[PW_BUFSIZE];	/* Lazy -- should call sysconf() */
+
+      if(getpwuid_r(msg_list->signal_uid, &pw, buf, PW_BUFSIZE, &result) == 0
+	 && result != NULL) {
+	fprintf(fp, "from user %s (%d) ", pw.pw_name, (int)pw.pw_uid);
+      }
+      else {
+	fprintf(fp, "from unknown user (%d) ", msg_list->signal_uid);
+      }
+
+      if(msg_list->signal_pid > (pid_t)0) {
+	fprintf(fp, "running process %d ", (int)msg_list->signal_pid);
+      }
+    }
+    else if(msg_list->signal_pid > (pid_t)0) {
+      fprintf(fp, "from process %d ", (int)msg_list->signal_pid);
+    }
+    if(msg_list->message != NULL) {
+      fprintf(fp, "\"%s\"", msg_list->message);
+    }
+    else {
+      fprintf(fp, "(no message)");
+    }
+    if(msg_list->child_status != 0) {
+      fprintf(fp, " child status %d", msg_list->child_status);
+    }
+
+    tail = msg_list->tail;
+    free(msg_list);
+    msg_list = tail;
+  }
+  else {
+    return 0;
+  }
+}
+
+void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
+		 pid_t mp, pid_t pp, int cld) {
+  msgq_t *new_msg;
+
+  new_msg = malloc(sizeof(msgq_t));
+  if(new_msg != NULL) {
+    new_msg->signal_number = n;
+    new_msg->message = msg;
+    new_msg->signal_time = t;
+    new_msg->signal_uid = u;
+    new_msg->signal_pid = sp;
+    new_msg->my_id = mp;
+    new_msg->parent_pid = pp;
+    new_msg->child_status = cld;
+    new_msg->tail = NULL;
+    if(next_msg != NULL) {
+      next_msg->tail = new_msg;
+      next_msg = new_msg;
+    }
+    if(msg_list == NULL) {
+      msg_list = new_msg;
+    }
+  }
+  else {
+    missed_msg++;
+  }
+}
 
 void handler(int signo, siginfo_t *info, ucontext_t *context) {
-  uid_t uid = -1;
-  pid_t spid = -1;
-  time_t sig_time;
+  time_t t;
+  uid_t u;
+  uid_t sp;
 
-  sig_time = time(NULL);
+  t = time(NULL);
   switch(info->si_code) {
   case SI_USER:
   case SI_QUEUE:
-    uid = info->si_uid;
-    spid = info->si_pid;
+    u = info->si_uid;
+    sp = info->si_pid;
     break;
   case SI_KERNEL:
     break;
