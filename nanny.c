@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <pwd.h>
+#include <sys/stat.h>
 
 void handler(int, siginfo_t *, void *);
 void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
@@ -53,6 +54,7 @@ typedef struct msgq {
 #define HOSTLEN 1024
 #define NSIGNALS 13
 #define PW_BUFSIZE 2048
+#define DEFAULT_LOG_DIR "log"
 
 pid_t pid = -1;
 char hostname[HOSTLEN];
@@ -60,7 +62,9 @@ int ok = 1;
 msgq_t *msg_list = NULL;
 msgq_t *next_msg = NULL;
 int missed_msg = 0;
+int caught_msg = 0;
 const char *whoami = "nanny";
+FILE *output = NULL;
 
 const char *signal_strs[NSIGNALS] = {
   "SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGALRM", "SIGTERM",
@@ -78,16 +82,92 @@ int main(int argc, char * const argv[]) {
   pid_t child_pid;
   struct sigaction action;
   int i;
+  const char *cmd;
+  char * const *cmd_argv;
+  const char *log_dir = DEFAULT_LOG_DIR;
+  struct stat log_stat;
+  char *log_file = NULL;
 
   pid = getpid();
   if(gethostname(hostname, (size_t)HOSTLEN) == -1) {
-    snprintf(hostname, HOSTLEN, "<host unknown: %d>", errno);
+    snprintf(hostname, HOSTLEN, "-host unknown %d-", errno);
   }
+
+  /* Process command-line arguments */
+
+  i = 1;
+  while(i < argc && argv[i][0] == '-') {
+    const char *opt = argv[i];
+
+    i++;
+    if(strcmp(opt, "--") == 0) {
+      break;
+    }
+    else if(strcmp(opt, "-wd") == 0) {
+      if(chdir(argv[i]) == -1) {
+	fprintf(stderr, "Changing working directory to ");
+	perror(argv[i]);
+	exit(1);
+      }
+      i++;
+    }
+    else if(strcmp(opt, "-log") == 0) {
+      log_dir = argv[i];
+      i++;
+    }
+  }
+  cmd = argv[i];
+  cmd_argv = &(argv[i]);
+
+  /* Check existence and/or create a log dir */
+  
+  if(stat(log_dir, &log_stat) == -1) {
+    if(errno == ENOENT) {
+      if(mkdir(log_dir, 0777) == -1) {
+	fprintf(stderr, "Creating log directory ");
+	perror(log_dir);
+	exit(1);
+      }
+    }
+    else {
+      fprintf(stderr, "Checking status of log directory ");
+      perror(log_dir);
+      exit(1);
+    }
+  }
+  else {			/* stat was successful; log_stat populated */
+    if((log_stat.st_mode & S_IFDIR) == 0) {
+      fprintf(stderr, "Log directory \"%s\" is not a directory\n", log_dir);
+      exit(1);
+    }
+    if(access(log_dir, R_OK | W_OK | X_OK) == -1) {
+      fprintf(stderr, "Checking access to log directory ");
+      perror(log_dir);
+      exit(1);
+    }
+  }
+
+  /* Create a log file, defaulting to stderr if there's a problem */
+
+  if(asprintf(&log_file, "%s/%s-%06d.txt", log_dir, hostname, pid) < 0) {
+    output = stderr;
+  }
+  else {
+    output = fopen(log_file, "w");
+    if(output == NULL) {
+      output = stderr;
+    }
+    free(log_file);
+  }
+
+  /* Trap as many signals as we can */
 
   memset(&action, 0, sizeof(struct sigaction));
   sigemptyset(&action.sa_mask);
   action.sa_sigaction = handler;
   action.sa_flags = SA_SIGINFO;
+
+  fprintf(output, "nanny is trapping [");
 
   for(i = 0; i < NSIGNALS; i++) {
     if(sigaction(signals[i], handler, NULL) == -1) {
@@ -95,16 +175,20 @@ int main(int argc, char * const argv[]) {
     }
     else {
       trapped[i] = 1;
+      fprintf(output, " %s", signal_strs[i]);
     }
   }
 
+  fprintf(output, " ]\n");
+
+  /* Fork and execute the desired command in the child */
 
   child_pid = fork();
   if(child_pid == 0) {
     /* child */
     whoami = "child";
     pid = getpid();
-    execvp(argv[0], argv);
+    execvp(cmd, cmd_argv);
     perror("execvp failed");
     exit(1);
   }
@@ -115,19 +199,20 @@ int main(int argc, char * const argv[]) {
   }
   else {
     /* parent */
-    int status;
+    int status = 1;
     whoami = "parent";
     do {
-      switch(waitpid(child_pid, &status, WUNTRACED)) {
-      case 0:
-	sleep(1);
+      switch(waitpid(child_pid, &status, WUNTRACED | WNOHANG)) {
+      case 0:			/* Only returned if WNOHANG in third arg */
+	status = 0;
 	break;
       case -1:
 	perror("waitpid failed");
 	exit(1);
       default:
+	caught_msg += print_message(output);
       }
-    } while(ok);
+    } while(status);
   }
 }
 
@@ -189,6 +274,8 @@ int print_message(FILE *fp) {
     tail = msg_list->tail;
     free(msg_list);
     msg_list = tail;
+
+    return 1;
   }
   else {
     return 0;
