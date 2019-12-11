@@ -32,19 +32,27 @@
 #include <pwd.h>
 #include <sys/stat.h>
 
+int print_message(FILE *);
+#ifdef __APPLE__
 void handler(int, siginfo_t *, void *);
-void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
-		 pid_t mp, pid_t pp, int cld);
+#else
+void handler(int, siginfo_t *, ucontext_t *);
+#endif
+void new_message(int, const char *, const char *, time_t, uid_t, clock_t,
+		 clock_t, pid_t, pid_t, pid_t, int);
 /* Data types */
 
 typedef struct msgq {
   int signal_number;
   const char *message;
+  const char *reason;
   time_t signal_time;
   uid_t signal_uid;
   pid_t signal_pid;
   pid_t my_pid;
   pid_t parent_pid;
+  clock_t user_time;
+  clock_t system_time;
   int child_status;
   struct msgq *tail;
 } msgq_t;
@@ -56,7 +64,8 @@ typedef struct msgq {
 #define PW_BUFSIZE 2048
 #define DEFAULT_LOG_DIR "log"
 
-pid_t pid = -1;
+pid_t pid = (pid_t)-1;
+pid_t ppid = (pid_t)-1;
 char hostname[HOSTLEN];
 int ok = 1;
 msgq_t *msg_list = NULL;
@@ -89,6 +98,7 @@ int main(int argc, char * const argv[]) {
   char *log_file = NULL;
 
   pid = getpid();
+  ppid = getppid();
   if(gethostname(hostname, (size_t)HOSTLEN) == -1) {
     snprintf(hostname, HOSTLEN, "-host unknown %d-", errno);
   }
@@ -164,13 +174,13 @@ int main(int argc, char * const argv[]) {
 
   memset(&action, 0, sizeof(struct sigaction));
   sigemptyset(&action.sa_mask);
-  action.sa_sigaction = handler;
+  action.sa_sigaction = &handler;
   action.sa_flags = SA_SIGINFO;
 
   fprintf(output, "nanny is trapping [");
 
   for(i = 0; i < NSIGNALS; i++) {
-    if(sigaction(signals[i], handler, NULL) == -1) {
+    if(sigaction(signals[i], &action, NULL) == -1) {
       trapped[i] = 0;
     }
     else {
@@ -187,6 +197,7 @@ int main(int argc, char * const argv[]) {
   if(child_pid == 0) {
     /* child */
     whoami = "child";
+    ppid = pid;
     pid = getpid();
     execvp(cmd, cmd_argv);
     perror("execvp failed");
@@ -223,16 +234,16 @@ int print_message(FILE *fp) {
   if(msg_list != NULL) {
     struct tm tim;
     int i;
-    msgq_t tail;
+    msgq_t *tail;
     
-    if(gmtime_r(msg_list->signal_time, &tim) != NULL) {
+    if(gmtime_r(&(msg_list->signal_time), &tim) != NULL) {
       fprintf(fp, "%04d%02d%02dT%02d%02d%02d ", tim.tm_year + 1900,
 	      tim.tm_mon + 1, tim.tm_mday, tim.tm_hour, tim.tm_min, tim.tm_sec);
     }
     else {
       fprintf(fp, "........T...... ");
     }
-    fprintf(fp, "nanny (%s %d | %d)@%s: ", whoami, (int)msg_list->my_id,
+    fprintf(fp, "nanny (%s %d | %d)@%s: ", whoami, (int)msg_list->my_pid,
 	    (int)msg_list->parent_pid, hostname);
     for(i = 0; i < NSIGNALS; i++) {
       if(signals[i] == msg_list->signal_number) {
@@ -282,18 +293,22 @@ int print_message(FILE *fp) {
   }
 }
 
-void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
-		 pid_t mp, pid_t pp, int cld) {
+void new_message(int n, const char *msg, const char *reason, time_t t, uid_t u,
+		 clock_t ut, clock_t st, pid_t sp, pid_t mp, pid_t pp, int cld)
+{
   msgq_t *new_msg;
 
   new_msg = malloc(sizeof(msgq_t));
   if(new_msg != NULL) {
     new_msg->signal_number = n;
     new_msg->message = msg;
+    new_msg->reason = reason;
     new_msg->signal_time = t;
     new_msg->signal_uid = u;
     new_msg->signal_pid = sp;
-    new_msg->my_id = mp;
+    new_msg->user_time = ut;
+    new_msg->system_time = st;
+    new_msg->my_pid = mp;
     new_msg->parent_pid = pp;
     new_msg->child_status = cld;
     new_msg->tail = NULL;
@@ -310,62 +325,130 @@ void new_message(int n, const char *msg, time_t t, uid_t u, pid_t sp,
   }
 }
 
+#ifdef __APPLE__
+void handler(int signo, siginfo_t *info, void *context) {
+#else
 void handler(int signo, siginfo_t *info, ucontext_t *context) {
-  time_t t;
-  uid_t u;
-  uid_t sp;
+#endif
+  time_t t = (time_t)0;
+  uid_t u = (uid_t)0;
+  pid_t sp = (pid_t)-1;
+  const char *msg = NULL;
+  const char *reason = NULL;
+  int n = signo;
+  pid_t mp = pid;
+  pid_t pp = ppid;
+  clock_t ut = (clock_t)-1;
+  clock_t st = (clock_t)-1;
+  int status = 0;
 
   t = time(NULL);
   switch(info->si_code) {
   case SI_USER:
-  case SI_QUEUE:
+    reason = "sent kill(2) by user";
     u = info->si_uid;
     sp = info->si_pid;
     break;
+  case SI_QUEUE:
+    reason = "received signal via sigqueue(3)";
+    u = info->si_uid;
+    sp = info->si_pid;
+    break;
+#ifdef SI_KERNEL
   case SI_KERNEL:
+    reason = "signal sent by kernal";
     break;
+#endif
   case SI_TIMER:
+    reason = "POSIX timer expired";
     break;
+#ifdef SI_TKILL
   case SI_TKILL:
+    reason = "tkill(2) or tgkill(2)";
     break;
+#endif
+  case SI_MESGQ:
+    reason = "POSIX message queue state changed (see mq_notify(3))";
+    break;
+  case SI_ASYNCIO:
+    reason = "asynchronous I/O completed";
+    break;
+  default:
+    reason = NULL;
   }
   switch(signo) {
   case SIGHUP:
+    msg = "hangup detected on controlling terminal or death of controlling "
+      "process";
     break;
   case SIGINT:
+    msg = "interrupt from keyboard";
     break;
   case SIGQUIT:
+    msg = "quit from keyboard";
+    break;
+  case SIGILL:
+    msg = "illegal instruction";
     break;
   case SIGABRT:
+    msg = "abort(3) signal received";
     break;
   case SIGALRM:
+    msg = "timer signal from alarm(3)";
     break;
   case SIGTERM:
+    msg = "termination signal";
     break;
   case SIGTSTP:
+    msg = "stop typed at terminal";
     break;
   case SIGCHLD:
+    u = info->si_uid;
+    sp = info->si_pid;
+    status = info->si_status;
+#ifndef __APPLE__
+    ut = info->si_utime;
+    st = info->si_stime;
+#endif
     switch(info->si_code) {
     case CLD_EXITED:
-      /* info->si_status has exit status */
+      msg = "child exited";
+      break;
     case CLD_KILLED:
+      msg = "child killed";
+      break;
     case CLD_DUMPED:
+      msg = "child core dumped";
+      break;
     case CLD_STOPPED:
+      msg = "child stopped";
+      break;
     case CLD_CONTINUED:
+      msg = "child continued";
+      break;
+    default:
+      msg = "child status chanaged";
     }
     break;
   case SIGXCPU:
+    msg = "CPU time limit exceeded -- set setrlimit(2)";
     break;
   case SIGXFSZ:
+    msg = "file size limit exceeded -- set setrlimit(2)";
     break;
-  case SIGVTARLM:
+  case SIGVTALRM:
+    msg = "virtual time alarm -- see setitimer(2)";
     break;
   case SIGPROF:
+    msg = "profiling timer alarm -- see setitimer(2)";
     break;
   case SIGUSR1:
+    msg = "user-defined signal 1";
     break;
   case SIGUSR2:
+    msg = "user-defined signal 2";
     break;
   default:
+    msg = "other signal caught";
   }
 }
