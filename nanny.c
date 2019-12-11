@@ -269,14 +269,27 @@ int print_message(FILE *fp) {
       fprintf(fp, "from process %d ", (int)msg_list->signal_pid);
     }
     if(msg_list->message != NULL) {
-      fprintf(fp, "\"%s\"", msg_list->message);
+      fprintf(fp, "\"%s\" ", msg_list->message);
     }
     else {
-      fprintf(fp, "(no message)");
+      fprintf(fp, "(no message) ");
+    }
+    if(msg_list->reason != NULL) {
+      fprintf(fp, "reason \"%s\"", msg_list->reason);
+    }
+    else {
+      fprintf(fp, "(no reason)");
     }
     if(msg_list->child_status != 0) {
       fprintf(fp, " child status %d", msg_list->child_status);
     }
+#ifndef __APPLE__
+    if(msg_list->user_time > (clock_t)0 || msg_list->system_time > (clock_t)0) {
+      fprintf(fp, " elapsed user time %ld; elapsed system time %ld",
+	      (long)msg_list->user_time, (long)msg_list->system_time);
+    }
+#endif
+    fprintf(fp, "\n");
 
     tail = msg_list->tail;
     free(msg_list);
@@ -443,4 +456,5 @@ void handler(int signo, siginfo_t *info, void *context) {
   default:
     msg = "other signal caught";
   }
+  new_message(signo, msg, reason, t, u, ut, st, sp, mp, pp, status);
 }
