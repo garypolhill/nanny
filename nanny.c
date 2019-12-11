@@ -33,11 +33,7 @@
 #include <sys/stat.h>
 
 int print_message(FILE *);
-#ifdef __APPLE__
 void handler(int, siginfo_t *, void *);
-#else
-void handler(int, siginfo_t *, ucontext_t *);
-#endif
 void new_message(int, const char *, const char *, time_t, uid_t, clock_t,
 		 clock_t, pid_t, pid_t, pid_t, int);
 /* Data types */
@@ -325,11 +321,7 @@ void new_message(int n, const char *msg, const char *reason, time_t t, uid_t u,
   }
 }
 
-#ifdef __APPLE__
 void handler(int signo, siginfo_t *info, void *context) {
-#else
-void handler(int signo, siginfo_t *info, ucontext_t *context) {
-#endif
   time_t t = (time_t)0;
   uid_t u = (uid_t)0;
   pid_t sp = (pid_t)-1;
