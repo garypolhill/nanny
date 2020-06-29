@@ -220,7 +220,14 @@ int main(int argc, char * const argv[]) {
 	caught_msg += print_message(output);
       }
     } while(status);
+
+    fprintf(output == NULL ? stdout : output,
+	    "%s exiting; %d messages caught, %d messages missed\n");
+    if(output != NULL) {
+      fclose(output);
+    }
   }
+  return 0;
 }
 
 int print_message(FILE *fp) {
