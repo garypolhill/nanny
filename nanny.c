@@ -198,13 +198,14 @@ int main(int argc, char * const argv[]) {
     pid = getpid();
     if(
 #if defined(PT_TRACE_ME)
-    ptrace(PT_TRACE_ME, (pid_t)0, NULL, 0)
+       ptrace(PT_TRACE_ME, (pid_t)0, NULL, 0)
 #elif defined(PTRACE_TRACEME)
-    ptrace(PTRACE_TRACEME, (pid_t)0, NULL, NULL) 
+       ptrace(PTRACE_TRACEME, (pid_t)0, NULL, NULL) 
 #else
 #  error "No PT_TRACE_ME or PTRACE_TRACEME"
+       -1
 #endif
-    == -1) {
+       == -1) {
       perror("ptrace failed");
       exit(1);
     }
@@ -223,10 +224,13 @@ int main(int argc, char * const argv[]) {
     if(
 #if defined(PT_ATTACHEXC)
        ptrace(PT_ATTACHEXC, child_pid, NULL, 0)
+#elif defined(PT_ATTACH)
+       ptrace(PT_ATTACH, child_pid, NULL, 0)
 #elif defined(PTRACE_ATTACH)
        ptrace(PTRACE_ATTACH, child_pid, NULL, 0)
 #else
-#  error "No PT_ATTACHEXEC or PTRACE_ATTACH"
+#  error "No PT_ATTACHEXEC, PT_ATTACH or PTRACE_ATTACH"
+       -1
 #endif
        == -1) {
       perror("ptrace attach failed");
@@ -275,6 +279,7 @@ int main(int argc, char * const argv[]) {
 	     ptrace(PTRACE_CONT, child_pid, NULL, signum)
 #else
 #  error "No PT_CONTINUE or PTRACE_CONT"
+             -1
 #endif
 	     == -1) {
 	    perror("ptrace continue failed");
