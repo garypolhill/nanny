@@ -28,22 +28,27 @@
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
-#include <time.h>
+#include <sys/time.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <sys/ptrace.h>
 
+void print_timestamp_time(FILE *);
+void print_timestamp(FILE *, struct timeval *);
 int print_message(FILE *);
 void handler(int, siginfo_t *, void *);
-void new_message(int, const char *, const char *, time_t, uid_t, clock_t,
-		 clock_t, pid_t, pid_t, pid_t, int);
+void internal_handler(int, siginfo_t *, pid_t, pid_t, const char *);
+void new_message(int, const char *, const char *, struct timeval, uid_t,
+		 clock_t, clock_t, pid_t, pid_t, pid_t, int, int,
+		 const char *);
 /* Data types */
 
 typedef struct msgq {
   int signal_number;
+  const char *whoami;
   const char *message;
   const char *reason;
-  time_t signal_time;
+  struct timeval signal_time;
   uid_t signal_uid;
   pid_t signal_pid;
   pid_t my_pid;
@@ -51,15 +56,20 @@ typedef struct msgq {
   clock_t user_time;
   clock_t system_time;
   int child_status;
+  int fd;
   struct msgq *tail;
 } msgq_t;
 
 /* Globals */
 
 #define HOSTLEN 1024
-#define NSIGNALS 13
+#define NSIGNALS 31
 #define PW_BUFSIZE 2048
 #define DEFAULT_LOG_DIR "log"
+#define ACT_TERM 1
+#define ACT_CORE 3
+#define ACT_IGN 2
+#define ACT_STOP 5
 
 pid_t pid = (pid_t)-1;
 pid_t ppid = (pid_t)-1;
@@ -69,27 +79,56 @@ msgq_t *msg_list = NULL;
 msgq_t *next_msg = NULL;
 int missed_msg = 0;
 int caught_msg = 0;
-const char *whoami = "nanny";
 FILE *output = NULL;
 
 const char *signal_strs[NSIGNALS] = {
-  "SIGHUP", "SIGINT", "SIGQUIT", "SIGABRT", "SIGALRM", "SIGTERM",
-  "SIGTSTP", "SIGCHLD", "SIGXCPU", "SIGXFSZ", "SIGPROF", "SIGUSR1", "SIGUSR2"
+  "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT",
+  "SIGEMT", "SIGFPE", "SIGKILL", "SIGBUS", "SIGSEGV", "SIGSYS", "SIGPIPE",
+  "SIGALRM", "SIGTERM", "SIGURG", "SIGSTOP", "SIGTSTP", "SIGCONT", "SIGCHLD",
+  "SIGTTIN", "SIGTTOU", "SIGIO", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF",
+  "SIGWINCH", "SIGINFO", "SIGUSR1", "SIGUSR2"
 };
 int trapped[NSIGNALS];
+int blocked[NSIGNALS];
 int signals[NSIGNALS] = {
-  SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGALRM, SIGTERM,
-  SIGTSTP, SIGCHLD, SIGXCPU, SIGXFSZ, SIGPROF, SIGUSR1, SIGUSR2
+  SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT,
+  SIGEMT, SIGFPE, SIGKILL, SIGBUS, SIGSEGV, SIGSYS, SIGPIPE,
+  SIGALRM, SIGTERM, SIGURG, SIGSTOP, SIGTSTP, SIGCONT, SIGCHLD,
+  SIGTTIN, SIGTTOU, SIGIO, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF,
+  SIGWINCH, SIGINFO, SIGUSR1, SIGUSR2
 };
+int defacts[NSIGNALS] = {
+  ACT_TERM, ACT_TERM, ACT_CORE, ACT_CORE, ACT_CORE, ACT_CORE,
+  ACT_CORE, ACT_CORE, ACT_TERM, ACT_CORE, ACT_CORE, ACT_CORE, ACT_TERM,
+  ACT_TERM, ACT_TERM, ACT_IGN, ACT_STOP, ACT_STOP, ACT_IGN, ACT_IGN,
+  ACT_STOP, ACT_STOP,
+#ifdef __APPLE__
+                      ACT_IGN, ACT_TERM, ACT_TERM, 
+#else
+                      ACT_TERM, ACT_CORE, ACT_CORE,
+#endif
+                                                    ACT_TERM, ACT_TERM,
+  ACT_IGN,
+#ifdef __APPLE__
+           ACT_IGN,
+#else
+           ACT_TERM,
+#endif
+                     ACT_TERM, ACT_TERM
+}; 
   
 /* Main */
 
 int main(int argc, char * const argv[]) {
   pid_t child_pid;
   struct sigaction action;
+  struct sigaction old_action;
+  sigset_t mask;
+  sigset_t old_mask;
   int i;
   const char *cmd;
   char * const *cmd_argv;
+  int cmd_argc;
   const char *log_dir = DEFAULT_LOG_DIR;
   struct stat log_stat;
   char *log_file = NULL;
@@ -125,10 +164,14 @@ int main(int argc, char * const argv[]) {
   }
   cmd = argv[i];
   cmd_argv = &(argv[i]);
+  cmd_argc = argc - i;
 
   /* Check existence and/or create a log dir */
   
-  if(stat(log_dir, &log_stat) == -1) {
+  if(strcmp(log_dir, "stderr") == 0) {
+    output = stderr;
+  }
+  else if(stat(log_dir, &log_stat) == -1) {
     if(errno == ENOENT) {
       if(mkdir(log_dir, 0777) == -1) {
 	fprintf(stderr, "Creating log directory ");
@@ -156,7 +199,8 @@ int main(int argc, char * const argv[]) {
 
   /* Create a log file, defaulting to stderr if there's a problem */
 
-  if(asprintf(&log_file, "%s/%s-%06d.txt", log_dir, hostname, pid) < 0) {
+  if(output != stderr &&
+     asprintf(&log_file, "%s/%s-%06d.txt", log_dir, hostname, pid) < 0) {
     output = stderr;
   }
   else {
@@ -167,33 +211,89 @@ int main(int argc, char * const argv[]) {
     free(log_file);
   }
 
-  /* Trap as many signals as we can */
+  /* Find out which signals are blocked and trapped */
 
-  memset(&action, 0, sizeof(struct sigaction));
-  sigemptyset(&action.sa_mask);
-  action.sa_sigaction = &handler;
-  action.sa_flags = SA_SIGINFO;
-
-  fprintf(output, "nanny is trapping [");
-
+  if(sigemptyset(&old_mask) == -1) {
+    perror("emptying old mask signal set");
+    exit(1);
+  }
+  if(sigemptyset(&mask) == -1) {
+    perror("emptying mask signal set");
+    exit(1);
+  }
+  if(sigprocmask(SIG_SETMASK, NULL, &old_mask) == -1) {
+    perror("getting signal mask");
+    exit(1);
+  }
   for(i = 0; i < NSIGNALS; i++) {
-    if(sigaction(signals[i], &action, NULL) == -1) {
-      trapped[i] = 0;
+    if(sigismember(&old_mask, signals[i])) {
+      blocked[i] = 1;
     }
     else {
-      trapped[i] = 1;
-      fprintf(output, " %s", signal_strs[i]);
+      blocked[i] = 0;
+    }
+
+    memset(&old_action, 0, sizeof(struct sigaction));
+    sigemptyset(&old_action.sa_mask);
+    if(sigaction(signals[i], NULL, &old_action) == -1) {
+      trapped[i] = -1;
+    }
+    else {
+      if((void *)old_action.sa_sigaction == (void *)SIG_IGN) {
+	trapped[i] = 0;
+      }
+      else if((void *)old_action.sa_sigaction == (void *)SIG_DFL) {
+	trapped[i] = 1;
+      }
+      else {
+	trapped[i] = 2;
+      }
     }
   }
 
-  fprintf(output, " ]\n");
+  /* Report on blocked/trapped signals we inherit as a process */
+
+  fprintf(output, "signal status:\n");
+  for(i = 0; i < NSIGNALS; i++) {
+    fprintf(output, "\t%s [", signal_strs[i]);
+    if(blocked[i]) {
+      fprintf(output, "blocked (");
+    }
+    if(trapped[i] == -1) {
+      fprintf(output, "error");
+    }
+    else if(trapped[i] == 0) {
+      fprintf(output, "ignored");
+    }
+    else if(trapped[i] == 1) {
+      fprintf(output, "default -- ");
+      if(defacts[i] == ACT_TERM) {
+	fprintf(output, "terminate");
+      }
+      else if(defacts[i] == ACT_CORE) {
+	fprintf(output, "core dump");
+      }
+      else if(defacts[i] == ACT_STOP) {
+	fprintf(output, "stop");
+      }
+      else if(defacts[i] == ACT_IGN) {
+	fprintf(output, "ignore");
+      }
+      else {
+	fprintf(stderr, "PANIC!");
+	abort();
+      }
+    }
+    if(blocked[i]) {
+      fprintf(output, ")");
+    }
+    fprintf(output, "]\n");
+  }
 
   /* Fork and execute the desired command in the child */
 
   child_pid = fork();
-  if(child_pid == 0) {
-    /* child */
-    whoami = "child";
+  if(child_pid == 0) {		/* child */
     ppid = pid;
     pid = getpid();
     if(
@@ -209,17 +309,48 @@ int main(int argc, char * const argv[]) {
       perror("ptrace failed");
       exit(1);
     }
+    print_timestamp_time(output);
+    fprintf(output, "child %d executing command cmd %s:", pid, cmd);
+    for(i = 0; i < cmd_argc; i++) {
+      fprintf(output, " %s", cmd_argv[i]);
+    }
+    fprintf(output, "\n");
     execvp(cmd, cmd_argv);
     perror("execvp failed");
     exit(1);
   }
-  else if(child_pid == -1) {
-    /* error */
+  else if(child_pid == -1) {    /* error */
     perror("fork failed");
     exit(1);
   }
-  else {
-    /* parent */
+  else {			/* parent */
+    int status;
+    int keepwaiting = 1;
+
+    /* Trap as many signals as we can */
+
+    memset(&action, 0, sizeof(struct sigaction));
+    sigemptyset(&action.sa_mask);
+    action.sa_sigaction = &handler;
+    action.sa_flags = SA_SIGINFO;
+
+    fprintf(output, "parent %d is trapping [", pid);
+
+    for(i = 0; i < NSIGNALS; i++) {
+      if(signals[i] == SIGKILL || signals[i] == SIGSTOP
+	 || defacts[i] == ACT_IGN) {
+	continue;
+      }
+      if(sigaction(signals[i], &action, NULL) == -1) {
+	trapped[i] = 0;
+      }
+      else {
+	trapped[i] = 1;
+	fprintf(output, " %s", signal_strs[i]);
+      }
+    }
+
+    fprintf(output, " ]\n");
 
     if(
 #if defined(PT_ATTACHEXC)
@@ -236,12 +367,14 @@ int main(int argc, char * const argv[]) {
       perror("ptrace attach failed");
       exit(1);
     }
-    int status = 1;
-    whoami = "parent";
+    print_timestamp_time(output);
+    fprintf(output, "parent %d successfully attached to child %d\n",
+	    pid, child_pid);
     do {
-      switch(waitpid(child_pid, &status, WUNTRACED | WNOHANG)) {
+      switch(waitpid(child_pid, &status, WUNTRACED)) {
       case 0:			/* Only returned if WNOHANG in third arg */
-	status = 0;
+	print_timestamp_time(output);
+	fprintf(output, "parent %d WNOHANGed from waitpid()\n", pid);
 	break;
       case -1:
 	perror("waitpid failed");
@@ -255,11 +388,11 @@ int main(int argc, char * const argv[]) {
 
 #if defined(PTRACE_GETSIGINFO)
 	  if(ptrace(PTRACE_GETSIGINFO, child_pid, NULL, &siginfo) != -1) {
-	    handler(signum, &siginfo, NULL);
+	    internal_handler(signum, &siginfo, child_pid, pid, "child");
 	  }
 	  else {
 	    perror("ptrace getsiginfo failed");
-	    handler(signum, NULL, NULL);
+	    internal_handler(signum, NULL, child_pid, pid, "child");
 	  }
 #else
 	  /* Macs now seemingly have their own odd system for managing
@@ -270,13 +403,13 @@ int main(int argc, char * const argv[]) {
 	   * the service I actually need this program for that I feel
 	   * disinclined to implement it
 	   */
-	  handler(signum, NULL, NULL);
+	  internal_handler(signum, NULL, child_pid, pid, "child");
 #endif
 	  if(
-#if defined(PT_CONTINUE)
-	     ptrace(PT_CONTINUE, child_pid, (caddr_t)1, signum)
-#elif defined(PTRACE_CONT)
+#if defined(PTRACE_CONT)
 	     ptrace(PTRACE_CONT, child_pid, NULL, signum)
+#elif defined(PT_CONTINUE)
+	     ptrace(PT_CONTINUE, child_pid, (caddr_t)1, signum)
 #else
 #  error "No PT_CONTINUE or PTRACE_CONT"
              -1
@@ -285,19 +418,70 @@ int main(int argc, char * const argv[]) {
 	    perror("ptrace continue failed");
 	    exit(1);
 	  }
+	  
+	  caught_msg += print_message(output);
 	}
-	caught_msg += print_message(output);
+	else if(WIFEXITED(status)) {
+	  print_timestamp_time(output);
+	  fprintf(output, "child %d exited with status %d\n", child_pid,
+		  WEXITSTATUS(status));
+	  keepwaiting = 0;
+	}
+	else if(WIFSIGNALED(status)) {
+	  print_timestamp_time(output);
+	  fprintf(output, "child %d terminated by signal %s\n", child_pid,
+		  strsignal(WTERMSIG(status)));
+	  keepwaiting = 0;
+	}
+#ifdef WCOREDUMP
+	else if(WCOREDUMP(status)) {
+	  print_timestamp_time(output);
+	  fprintf(output, "child %d dumped core\n", child_pid);
+	  keepwaiting = 0;
+	}
+#endif
+#ifdef WIFCONTINUED
+	else if(WIFCONTINUED(status)) {
+	  print_timestamp_time(output);
+	  fprintf(output, "child %d continued\n", child_pid);
+	}
+#endif
       }
-    } while(status);
+    } while(keepwaiting);
 
-    fprintf(output == NULL ? stdout : output,
-	    "%s exiting; %d messages caught, %d messages missed\n",
-	    cmd, caught_msg, missed_msg);
-    if(output != NULL) {
+    print_timestamp_time(output);
+    fprintf(output, "parent %d exiting; %d messages caught, %d messages "
+	    "missed\n", pid, caught_msg, missed_msg);
+    if(output != stderr) {
       fclose(output);
     }
   }
   return 0;
+}
+
+void print_timestamp_time(FILE *fp) {
+  struct timeval tm;
+
+  if(gettimeofday(&tm, NULL) != -1) {
+    print_timestamp(fp, &tm);
+  }
+  else {
+    fprintf(fp, "........T............. ");
+  }
+}
+
+void print_timestamp(FILE *fp, struct timeval *tm) {
+  struct tm tim;
+
+  if(!(tm->tv_sec == 0 && tm->tv_usec == 0)
+     && gmtime_r(&(tm->tv_sec), &tim) != NULL) {
+    fprintf(fp, "%04d%02d%02dT%02d%02d%02d.%06d ", tim.tm_year + 1900,
+	    tim.tm_mon + 1, tim.tm_mday, tim.tm_hour, tim.tm_min, tim.tm_sec,
+	    (int)tm->tv_usec);
+  }
+  else {
+    fprintf(fp, "........T............. ");
+  }
 }
 
 int print_message(FILE *fp) {
@@ -305,22 +489,16 @@ int print_message(FILE *fp) {
     fp = stdout;
   }
   if(msg_list != NULL) {
-    struct tm tim;
     int i;
     msgq_t *tail;
-    
-    if(gmtime_r(&(msg_list->signal_time), &tim) != NULL) {
-      fprintf(fp, "%04d%02d%02dT%02d%02d%02d ", tim.tm_year + 1900,
-	      tim.tm_mon + 1, tim.tm_mday, tim.tm_hour, tim.tm_min, tim.tm_sec);
-    }
-    else {
-      fprintf(fp, "........T...... ");
-    }
-    fprintf(fp, "nanny (%s %d | %d)@%s: ", whoami, (int)msg_list->my_pid,
-	    (int)msg_list->parent_pid, hostname);
+
+    print_timestamp(fp, &(msg_list->signal_time));
+    fprintf(fp, "nanny (%s %d | %d)@%s: ", msg_list->whoami,
+	    (int)msg_list->my_pid, (int)msg_list->parent_pid, hostname);
     for(i = 0; i < NSIGNALS; i++) {
       if(signals[i] == msg_list->signal_number) {
 	fprintf(fp, "%s (%d) caught ", signal_strs[i], signals[i]);
+	break;
       }
     }
     if(i == NSIGNALS) {
@@ -360,6 +538,9 @@ int print_message(FILE *fp) {
     else {
       fprintf(fp, "(no reason)");
     }
+    if(msg_list->fd != -1) {
+      fprintf(fp, " fd %d", msg_list->fd);
+    }
     if(msg_list->child_status != 0) {
       fprintf(fp, " child status %d", msg_list->child_status);
     }
@@ -382,8 +563,9 @@ int print_message(FILE *fp) {
   }
 }
 
-void new_message(int n, const char *msg, const char *reason, time_t t, uid_t u,
-		 clock_t ut, clock_t st, pid_t sp, pid_t mp, pid_t pp, int cld)
+void new_message(int n, const char *msg, const char *reason, struct timeval t,
+		 uid_t u, clock_t ut, clock_t st, pid_t sp, pid_t mp, pid_t pp,
+		 int fd, int cld, const char *whoami)
 {
   msgq_t *new_msg;
 
@@ -400,6 +582,8 @@ void new_message(int n, const char *msg, const char *reason, time_t t, uid_t u,
     new_msg->my_pid = mp;
     new_msg->parent_pid = pp;
     new_msg->child_status = cld;
+    new_msg->fd = fd;
+    new_msg->whoami = whoami;
     new_msg->tail = NULL;
     if(next_msg != NULL) {
       next_msg->tail = new_msg;
@@ -415,19 +599,28 @@ void new_message(int n, const char *msg, const char *reason, time_t t, uid_t u,
 }
 
 void handler(int signo, siginfo_t *info, void *context) {
-  time_t t = (time_t)0;
+  internal_handler(signo, info, pid, ppid, "parent");
+}
+
+void internal_handler(int signo, siginfo_t *info, pid_t mypid, pid_t parent,
+		      const char *whoami) {
+  struct timeval t;
   uid_t u = (uid_t)0;
   pid_t sp = (pid_t)-1;
   const char *msg = NULL;
   const char *reason = NULL;
   int n = signo;
-  pid_t mp = pid;
-  pid_t pp = ppid;
+  pid_t mp = mypid;
+  pid_t pp = parent;
   clock_t ut = (clock_t)-1;
   clock_t st = (clock_t)-1;
   int status = 0;
+  int fd = -1;
 
-  t = time(NULL);
+  if(gettimeofday(&t, NULL) == -1) {
+    t.tv_sec = 0;
+    t.tv_usec = 0;
+  }
   if(info != NULL) {
     switch(info->si_code) {
     case SI_USER:
@@ -442,11 +635,15 @@ void handler(int signo, siginfo_t *info, void *context) {
       break;
 #ifdef SI_KERNEL
     case SI_KERNEL:
-      reason = "signal sent by kernal";
+      reason = "signal sent by kernel";
       break;
 #endif
     case SI_TIMER:
       reason = "POSIX timer expired";
+      /* N.B. on some linuxes, the si_overrun and si_timerid fields of
+       * siginfo_t give the timer_overrun(2) and the kernel ID of the timer
+       * respectively -- but these are not likely to help much in diagnostics
+       */
       break;
 #ifdef SI_TKILL
     case SI_TKILL:
@@ -455,43 +652,22 @@ void handler(int signo, siginfo_t *info, void *context) {
 #endif
     case SI_MESGQ:
       reason = "POSIX message queue state changed (see mq_notify(3))";
+      u = info->si_uid;
+      sp = info->si_pid;
       break;
     case SI_ASYNCIO:
       reason = "asynchronous I/O completed";
       break;
-    default:
-      reason = NULL;
     }
   }
-  else {
-    reason = NULL;
-  }
+  
+  msg = strsignal(signo);
+  
+  /* change the default signal string and/or get extra information about
+   * the reason for the signal if there's more info we can glean
+   */
   switch(signo) {
-  case SIGHUP:
-    msg = "hangup detected on controlling terminal or death of controlling "
-      "process";
-    break;
-  case SIGINT:
-    msg = "interrupt from keyboard";
-    break;
-  case SIGQUIT:
-    msg = "quit from keyboard";
-    break;
-  case SIGILL:
-    msg = "illegal instruction";
-    break;
-  case SIGABRT:
-    msg = "abort(3) signal received";
-    break;
-  case SIGALRM:
-    msg = "timer signal from alarm(3)";
-    break;
-  case SIGTERM:
-    msg = "termination signal";
-    break;
-  case SIGTSTP:
-    msg = "stop typed at terminal";
-    break;
+ 
   case SIGCHLD:
     if(info != NULL) {
       u = info->si_uid;
@@ -517,34 +693,157 @@ void handler(int signo, siginfo_t *info, void *context) {
       case CLD_CONTINUED:
 	msg = "child continued";
 	break;
-      default:
+       default:
 	msg = "child status chanaged";
       }
     }
-    else {
-      msg = "unknown child signal";
+    break;
+  case SIGILL:
+    if(info != NULL) {
+      switch(info->si_code) {
+      case ILL_ILLOPC:
+	reason = "illegal opcode";
+	break;
+      case ILL_ILLOPN:
+	reason = "illegal operand";
+	break;
+      case ILL_ILLADR:
+	reason = "illegal addressing mode";
+	break;
+      case ILL_ILLTRP:
+	reason = "illegal trap";
+	break;
+      case ILL_PRVOPC:
+	reason = "privileged opcode";
+	break;
+      case ILL_PRVREG:
+	reason = "privileged register";
+	break;
+      case ILL_COPROC:
+	reason = "coprocessor error";
+	break;
+      case ILL_BADSTK:
+	reason = "internal stack error";
+	break;
+      }
     }
     break;
-  case SIGXCPU:
-    msg = "CPU time limit exceeded -- set setrlimit(2)";
+  case SIGFPE:
+    if(info != NULL) {
+      switch(info->si_code) {
+      case FPE_INTDIV:
+	reason = "integer divide by zero";
+	break;
+      case FPE_INTOVF:
+	reason = "integer overflow";
+	break;
+      case FPE_FLTDIV:
+	reason = "floating-point divide by zero";
+	break;
+      case FPE_FLTOVF:
+	reason = "floating-point overflow";
+	break;
+      case FPE_FLTUND:
+	reason = "floating-point underflow";
+	break;
+      case FPE_FLTRES:
+	reason = "floating-point inexact result";
+	break;
+      case FPE_FLTINV:
+	reason = "floating-point invalid operation";
+	break;
+      case FPE_FLTSUB:
+	reason = "subscript out of range";
+	break;
+      }
+    }
     break;
-  case SIGXFSZ:
-    msg = "file size limit exceeded -- set setrlimit(2)";
+  case SIGSEGV:
+    if(info != NULL) {
+      switch(info->si_code) {
+      case SEGV_MAPERR:
+	reason = "address not mapped to object";
+	break;
+      case SEGV_ACCERR:
+	reason = "invalid permissions for mapped object";
+	break;
+      }
+    }
     break;
-  case SIGVTALRM:
-    msg = "virtual time alarm -- see setitimer(2)";
+  case SIGBUS:
+    if(info != NULL) {
+      switch(info->si_code) {
+      case BUS_ADRALN:
+	reason = "invalid address alignment";
+	break;
+      case BUS_ADRERR:
+	reason = "nonexistent physical address";
+	break;
+      case BUS_OBJERR:
+	reason = "object-specific hardware error";
+	break;
+#ifdef BUS_MCEERR_AR
+      case BUS_MCEERR_AR:
+	reason = "hardware memory error -- action required";
+	break;
+#endif
+#ifdef BUS_MCEERR_AO
+      case BUS_MCEERR_AO:
+	reason = "hardware memory error -- action optional";
+	break;
+#endif
+      }
+    }
     break;
-  case SIGPROF:
-    msg = "profiling timer alarm -- see setitimer(2)";
+  case SIGTRAP:
+    if(info != NULL) {
+      switch(info->si_code) {
+      case TRAP_BRKPT:
+	reason = "process breakpoint";
+	break;
+      case TRAP_TRACE:
+	reason = "process trace trap";
+	break;
+#ifdef TRAP_BRANCH
+      case TRAP_BRANCH:
+	reason = "process taken branch trap";
+	break;
+#endif
+#ifdef TRAP_HWBKPT	
+      case TRAP_HWBKPT:
+	reason = "hardware breakpoint/watchpoint";
+	break;
+#endif
+      }
+    }
     break;
-  case SIGUSR1:
-    msg = "user-defined signal 1";
+  case SIGIO:
+    if(info != NULL) {
+#ifndef __APPLE__
+      fd = info->si_fd;
+#endif
+      switch(info->si_code) {
+      case POLL_IN:
+	reason = "data input available";
+	break;
+      case POLL_OUT:
+	reason = "output buffers available";
+	break;
+      case POLL_MSG:
+	reason = "input message available";
+	break;
+      case POLL_ERR:
+	reason = "I/O error";
+	break;
+      case POLL_PRI:
+	reason = "high priority input available";
+	break;
+      case POLL_HUP:
+	reason = "device disconnected";
+	break;
+      }
+    }
     break;
-  case SIGUSR2:
-    msg = "user-defined signal 2";
-    break;
-  default:
-    msg = "other signal caught";
   }
-  new_message(signo, msg, reason, t, u, ut, st, sp, mp, pp, status);
+  new_message(signo, msg, reason, t, u, ut, st, sp, mp, pp, fd, status, whoami);
 }
