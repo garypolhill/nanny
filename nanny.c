@@ -31,6 +31,7 @@
 #include <time.h>
 #include <pwd.h>
 #include <sys/stat.h>
+#include <sys/ptrace.h>
 
 int print_message(FILE *);
 void handler(int, siginfo_t *, void *);
@@ -195,6 +196,18 @@ int main(int argc, char * const argv[]) {
     whoami = "child";
     ppid = pid;
     pid = getpid();
+    if(
+#if defined(PT_TRACE_ME)
+    ptrace(PT_TRACE_ME, (pid_t)0, NULL, 0)
+#elif defined(PTRACE_TRACEME)
+    ptrace(PTRACE_TRACEME, (pid_t)0, NULL, NULL) 
+#else
+#  error "No PT_TRACE_ME or PTRACE_TRACEME"
+#endif
+    == -1) {
+      perror("ptrace failed");
+      exit(1);
+    }
     execvp(cmd, cmd_argv);
     perror("execvp failed");
     exit(1);
@@ -206,6 +219,19 @@ int main(int argc, char * const argv[]) {
   }
   else {
     /* parent */
+
+    if(
+#if defined(PT_ATTACHEXC)
+       ptrace(PT_ATTACHEXC, child_pid, NULL, 0)
+#elif defined(PTRACE_ATTACH)
+       ptrace(PTRACE_ATTACH, child_pid, NULL, 0)
+#else
+#  error "No PT_ATTACHEXEC or PTRACE_ATTACH"
+#endif
+       == -1) {
+      perror("ptrace attach failed");
+      exit(1);
+    }
     int status = 1;
     whoami = "parent";
     do {
@@ -217,12 +243,51 @@ int main(int argc, char * const argv[]) {
 	perror("waitpid failed");
 	exit(1);
       default:
+	if(WIFSTOPPED(status)) {
+	  int signum;
+	  siginfo_t siginfo;
+
+	  signum = WSTOPSIG(status);
+
+#if defined(PTRACE_GETSIGINFO)
+	  if(ptrace(PTRACE_GETSIGINFO, child_pid, NULL, &siginfo) != -1) {
+	    handler(signum, &siginfo, NULL);
+	  }
+	  else {
+	    perror("ptrace getsiginfo failed");
+	    handler(signum, NULL, NULL);
+	  }
+#else
+	  /* Macs now seemingly have their own odd system for managing
+	   * these things involving EXC_SOFT_SIGNAL or something. A web
+	   * page here describes it: https://www.spaceflint.com/?p=150
+	   * and if that is appropriately representative of how things are
+	   * handled now, it is sufficiently dissimilar from the system on
+	   * the service I actually need this program for that I feel
+	   * disinclined to implement it
+	   */
+	  handler(signum, NULL, NULL);
+#endif
+	  if(
+#if defined(PT_CONTINUE)
+	     ptrace(PT_CONTINUE, child_pid, (caddr_t)1, signum)
+#elif defined(PTRACE_CONT)
+	     ptrace(PTRACE_CONT, child_pid, NULL, signum)
+#else
+#  error "No PT_CONTINUE or PTRACE_CONT"
+#endif
+	     == -1) {
+	    perror("ptrace continue failed");
+	    exit(1);
+	  }
+	}
 	caught_msg += print_message(output);
       }
     } while(status);
 
     fprintf(output == NULL ? stdout : output,
-	    "%s exiting; %d messages caught, %d messages missed\n");
+	    "%s exiting; %d messages caught, %d messages missed\n",
+	    cmd, caught_msg, missed_msg);
     if(output != NULL) {
       fclose(output);
     }
@@ -258,7 +323,10 @@ int print_message(FILE *fp) {
     }
     if(msg_list->signal_uid > (uid_t)0) {
       struct passwd pw, *result = NULL;
-      char buf[PW_BUFSIZE];	/* Lazy -- should call sysconf() */
+      char buf[PW_BUFSIZE];	/* Lazy -- should call sysconf(); except that
+				 * on Macs, _SC_GETPW_R_SIZE_MAX is not
+				 * defined
+				 */
 
       if(getpwuid_r(msg_list->signal_uid, &pw, buf, PW_BUFSIZE, &result) == 0
 	 && result != NULL) {
@@ -355,37 +423,42 @@ void handler(int signo, siginfo_t *info, void *context) {
   int status = 0;
 
   t = time(NULL);
-  switch(info->si_code) {
-  case SI_USER:
-    reason = "sent kill(2) by user";
-    u = info->si_uid;
-    sp = info->si_pid;
-    break;
-  case SI_QUEUE:
-    reason = "received signal via sigqueue(3)";
-    u = info->si_uid;
-    sp = info->si_pid;
-    break;
+  if(info != NULL) {
+    switch(info->si_code) {
+    case SI_USER:
+      reason = "sent kill(2) by user";
+      u = info->si_uid;
+      sp = info->si_pid;
+      break;
+    case SI_QUEUE:
+      reason = "received signal via sigqueue(3)";
+      u = info->si_uid;
+      sp = info->si_pid;
+      break;
 #ifdef SI_KERNEL
-  case SI_KERNEL:
-    reason = "signal sent by kernal";
-    break;
+    case SI_KERNEL:
+      reason = "signal sent by kernal";
+      break;
 #endif
-  case SI_TIMER:
-    reason = "POSIX timer expired";
-    break;
+    case SI_TIMER:
+      reason = "POSIX timer expired";
+      break;
 #ifdef SI_TKILL
-  case SI_TKILL:
-    reason = "tkill(2) or tgkill(2)";
-    break;
+    case SI_TKILL:
+      reason = "tkill(2) or tgkill(2)";
+      break;
 #endif
-  case SI_MESGQ:
-    reason = "POSIX message queue state changed (see mq_notify(3))";
-    break;
-  case SI_ASYNCIO:
-    reason = "asynchronous I/O completed";
-    break;
-  default:
+    case SI_MESGQ:
+      reason = "POSIX message queue state changed (see mq_notify(3))";
+      break;
+    case SI_ASYNCIO:
+      reason = "asynchronous I/O completed";
+      break;
+    default:
+      reason = NULL;
+    }
+  }
+  else {
     reason = NULL;
   }
   switch(signo) {
@@ -415,31 +488,36 @@ void handler(int signo, siginfo_t *info, void *context) {
     msg = "stop typed at terminal";
     break;
   case SIGCHLD:
-    u = info->si_uid;
-    sp = info->si_pid;
-    status = info->si_status;
+    if(info != NULL) {
+      u = info->si_uid;
+      sp = info->si_pid;
+      status = info->si_status;
 #ifndef __APPLE__
-    ut = info->si_utime;
-    st = info->si_stime;
+      ut = info->si_utime;
+      st = info->si_stime;
 #endif
-    switch(info->si_code) {
-    case CLD_EXITED:
-      msg = "child exited";
-      break;
-    case CLD_KILLED:
-      msg = "child killed";
-      break;
-    case CLD_DUMPED:
-      msg = "child core dumped";
-      break;
-    case CLD_STOPPED:
-      msg = "child stopped";
-      break;
-    case CLD_CONTINUED:
-      msg = "child continued";
-      break;
-    default:
-      msg = "child status chanaged";
+      switch(info->si_code) {
+      case CLD_EXITED:
+	msg = "child exited";
+	break;
+      case CLD_KILLED:
+	msg = "child killed";
+	break;
+      case CLD_DUMPED:
+	msg = "child core dumped";
+	break;
+      case CLD_STOPPED:
+	msg = "child stopped";
+	break;
+      case CLD_CONTINUED:
+	msg = "child continued";
+	break;
+      default:
+	msg = "child status chanaged";
+      }
+    }
+    else {
+      msg = "unknown child signal";
     }
     break;
   case SIGXCPU:
