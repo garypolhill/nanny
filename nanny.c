@@ -67,10 +67,6 @@ typedef struct msgq {
 #define NSIGNALS 31
 #define PW_BUFSIZE 2048
 #define DEFAULT_LOG_DIR "log"
-#define ACT_TERM 1
-#define ACT_CORE 3
-#define ACT_IGN 2
-#define ACT_STOP 5
 
 pid_t pid = (pid_t)-1;
 pid_t ppid = (pid_t)-1;
@@ -83,41 +79,48 @@ int caught_msg = 0;
 FILE *output = NULL;
 
 const char *signal_strs[NSIGNALS] = {
+#ifdef __APPLE__
   "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT",
   "SIGEMT", "SIGFPE", "SIGKILL", "SIGBUS", "SIGSEGV", "SIGSYS", "SIGPIPE",
   "SIGALRM", "SIGTERM", "SIGURG", "SIGSTOP", "SIGTSTP", "SIGCONT", "SIGCHLD",
   "SIGTTIN", "SIGTTOU", "SIGIO", "SIGXCPU", "SIGXFSZ", "SIGVTALRM", "SIGPROF",
   "SIGWINCH", "SIGINFO", "SIGUSR1", "SIGUSR2"
+#else
+  "SIGHUP", "SIGINT", "SIGQUIT", "SIGILL", "SIGTRAP", "SIGABRT",
+  "SIGBUS", "SIGFPE", "SIGKILL", "SIGUSR1", "SIGSEGV", "SIGUSR2", "SIGPIPE",
+  "SIGALRM", "SIGTERM", "SIGSTKFLT", "SIGCHLD", "SIGCONT", "SIGSTOP",
+  "SIGTSTP", "SIGTTIN", "SIGTTOU", "SIGURG", "SIGXCPU", "SIGXFSZ",
+  "SIGVTALRM", "SIGPROF", "SIGWINCH", "SIGIO", "SIGPWR", "SIGSYS"
+#endif
 };
+
 int trapped[NSIGNALS];
 int blocked[NSIGNALS];
 int signals[NSIGNALS] = {
+#ifdef __APPLE__
   SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT,
   SIGEMT, SIGFPE, SIGKILL, SIGBUS, SIGSEGV, SIGSYS, SIGPIPE,
   SIGALRM, SIGTERM, SIGURG, SIGSTOP, SIGTSTP, SIGCONT, SIGCHLD,
   SIGTTIN, SIGTTOU, SIGIO, SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF,
   SIGWINCH, SIGINFO, SIGUSR1, SIGUSR2
+#else
+  SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT,
+  SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV, SIGUSR2, SIGPIPE,
+  SIGALRM, SIGTERM, SIGSTKFLT, SIGCHLD, SIGCONT, SIGSTOP,
+  SIGTSTP, SIGTTIN, SIGTTOU, SIGURG, SIGXCPU, SIGXFSZ,
+  SIGVTALRM, SIGPROF, SIGWINCH, SIGIO, SIGPWR, SIGSYS
+#endif
 };
-int defacts[NSIGNALS] = {
-  ACT_TERM, ACT_TERM, ACT_CORE, ACT_CORE, ACT_CORE, ACT_CORE,
-  ACT_CORE, ACT_CORE, ACT_TERM, ACT_CORE, ACT_CORE, ACT_CORE, ACT_TERM,
-  ACT_TERM, ACT_TERM, ACT_IGN, ACT_STOP, ACT_STOP, ACT_IGN, ACT_IGN,
-  ACT_STOP, ACT_STOP,
-#ifdef __APPLE__
-                      ACT_IGN, ACT_TERM, ACT_TERM, 
-#else
-                      ACT_TERM, ACT_CORE, ACT_CORE,
-#endif
-                                                    ACT_TERM, ACT_TERM,
-  ACT_IGN,
-#ifdef __APPLE__
-           ACT_IGN,
-#else
-           ACT_TERM,
-#endif
-                     ACT_TERM, ACT_TERM
-}; 
-  
+int nannyhandle[] = {
+  SIGHUP, SIGINT, SIGQUIT, SIGTRAP, SIGABRT, SIGALRM, SIGTERM, SIGTSTP,
+  SIGVTALRM, SIGPROF, SIGCHLD,
+  -1			/* Important to avoid seg fault */
+};
+int nannyignore[] = {
+  SIGTRAP,
+  -1			/* Important to avoid seg fault */
+};
+
 /* Main */
 
 int main(int argc, char * const argv[]) {
@@ -267,23 +270,10 @@ int main(int argc, char * const argv[]) {
       fprintf(output, "ignored");
     }
     else if(trapped[i] == 1) {
-      fprintf(output, "default -- ");
-      if(defacts[i] == ACT_TERM) {
-	fprintf(output, "terminate");
-      }
-      else if(defacts[i] == ACT_CORE) {
-	fprintf(output, "core dump");
-      }
-      else if(defacts[i] == ACT_STOP) {
-	fprintf(output, "stop");
-      }
-      else if(defacts[i] == ACT_IGN) {
-	fprintf(output, "ignore");
-      }
-      else {
-	fprintf(stderr, "PANIC!");
-	abort();
-      }
+      fprintf(output, "default");
+    }
+    else if(trapped[i] == 2) {
+      fprintf(output, "handler");
     }
     if(blocked[i]) {
       fprintf(output, ")");
@@ -337,17 +327,16 @@ int main(int argc, char * const argv[]) {
 
     fprintf(output, "parent %d is trapping [", pid);
 
-    for(i = 0; i < NSIGNALS; i++) {
-      if(signals[i] == SIGKILL || signals[i] == SIGSTOP
-	 || defacts[i] == ACT_IGN) {
+    for(i = 0; nannyhandle[i] != -1; i++) {
+      if(nannyhandle[i] == SIGKILL || nannyhandle[i] == SIGSTOP) {
 	continue;
       }
-      if(sigaction(signals[i], &action, NULL) == -1) {
+      if(sigaction(nannyhandle[i], &action, NULL) == -1) {
 	trapped[i] = 0;
       }
       else {
 	trapped[i] = 1;
-	fprintf(output, " %s", signal_strs[i]);
+	fprintf(output, " %s", strsignal(nannyhandle[i]));
       }
     }
 
@@ -386,6 +375,9 @@ int main(int argc, char * const argv[]) {
 	  siginfo_t siginfo;
 
 	  signum = WSTOPSIG(status);
+	  print_timestamp_time(output);
+	  fprintf(output, "child %d received signal %s\n", child_pid,
+		  strsignal(signum));
 
 #if defined(PTRACE_GETSIGINFO)
 	  if(ptrace(PTRACE_GETSIGINFO, child_pid, NULL, &siginfo) != -1) {
@@ -406,6 +398,20 @@ int main(int argc, char * const argv[]) {
 	   */
 	  internal_handler(signum, NULL, child_pid, pid, "child");
 #endif
+	  for(i = 0; nannyignore[i] != -1; i++) {
+	    if(signum == nannyignore[i]) {
+	      print_timestamp_time(output);
+	      fprintf(output, "parent %d not passing signal %s to child %d\n",
+		      pid, strsignal(signum), child_pid);
+	      signum = 0;
+	      break;
+	    }
+	  }
+	  if(signum != 0) {
+	    print_timestamp_time(output);
+	    fprintf(output, "parent %d will pass signal %s to child %d\n",
+		    pid, strsignal(signum), child_pid);
+	  }
 	  if(
 #if defined(PTRACE_CONT)
 	     ptrace(PTRACE_CONT, child_pid, NULL, signum)
