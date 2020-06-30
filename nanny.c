@@ -29,6 +29,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <sys/time.h>
+#include <time.h>
 #include <pwd.h>
 #include <sys/stat.h>
 #include <sys/ptrace.h>
