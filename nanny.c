@@ -3,7 +3,9 @@
  * Gary Polhill, 28 November 2019
  *
  * C program to 'nanny' a command you want to run and give you information about
- * its termination and any signals it got sent.
+ * its termination and any signals it got sent. Doesn't currently work properly
+ * and for normal usage would anyway require elevated privileges as ptrace is
+ * restricted.
  *
  * Copyright (C) 2019  The James Hutton Institute
  *
