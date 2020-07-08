@@ -35,6 +35,7 @@
 #include <sys/types.h>
 #include <pwd.h>
 #include <uuid/uuid.h>
+#include <sys/resource.h>
 
 /* typedefs
  */
@@ -607,6 +608,7 @@ void wait_for_child(int secs, void(*func)(void)) {
     while(keepwaiting) {
       int status;
       struct timespec sleep_time;
+      struct rusage usage;
       
       switch(waitpid(child_pid, &status, WUNTRACED)) {
       case -1:
@@ -636,6 +638,27 @@ void wait_for_child(int secs, void(*func)(void)) {
 	nanosleep(&sleep_time, NULL);
 	break;
       default:
+	if(getrusage(RUSAGE_CHILDREN, &usage) != -1) {
+	  log_timestamp();
+	  fprintf(log_fp, "child %d rusage info -- system time: %ld.%06ds, "
+		  "user time: %ld.%06ds, memory: %ld%s, minor/major page "
+		  "faults: %ld / %ld, swaps: %ld, signals: %ld, "
+		  "I/O: %ld / %ld, in/voluntary context switches: %ld / %ld"
+		  "\n", child_pid,
+		  (long)(usage.ru_stime.tv_sec), usage.ru_stime.tv_usec,
+		  (long)(usage.ru_utime.tv_sec), usage.ru_utime.tv_usec,
+		  usage.ru_maxrss,
+#ifdef __APPLE__
+		  "b",
+#else
+		  "k",
+#endif
+		  usage.ru_minflt, usage.ru_majflt,
+		  usage.ru_nswap,
+		  usage.ru_nsignals,
+		  usage.ru_inblock, usage.ru_oublock,
+		  usage.ru_nivcsw, usage.ru_nvcsw);
+	}
 	if(WIFSTOPPED(status)) {
 	  int signum;
 

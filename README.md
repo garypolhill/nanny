@@ -91,6 +91,7 @@ The following things are logged:
   + Child exited
   + Child terminated by signal
   + Child dumped core (if the API provides this information)
++ Results from `getrusage(2)`
 + Parent receipt of any trapped signals (including any information provided in the `siginfo_t` argument to the handler -- see `sigaction(2)` -- including UID and PID of process that sent the signal)
 + If the built-in `sleep` option is interrupted (see `-f` option)
 + Other output from the built-in functions just to prove they did something (see `-f` option)
@@ -120,3 +121,9 @@ With these caveats in mind, the following functionality is available:
 + `-t` sets the maximum number of restarts (by default, `4`).
 
 I haven't tested any of the `-p`, `-r`, `-s`, or `-t` options at the time of writing. If future, it may be better if these options are replaced by code that records the fact that the command failed, but then makes it easy for you to rerun a batch with just the failed commands.
+
+### Extensions
+
++ (Implemented) Use `wait4(2)` instead of `waitpid(2)` so that the `struct rusage` for the child can be inspected and reported on. The potentially useful fields of that are `ru_[us]time` (user and system time `struct timeval`s), `ru_maxrss` (a `long` containing the maximum resident set size used in kilobytes), `ru_(min|maj)flt` (minor/major page fault `long`s), `ru_nswap` and `ru_nsignals` (number of swaps and number of signals -- both `long`s, but apparently and somewhat frustratingly these are unused), `ru_(in|out)block` (input/output count `long`s) and `ru_ni?vcsw` (numbers of (in)voluntary context switch `long`s). One reason for not doing this is that `wait4(2)` is not portable and/or appears to be deprecated. This has now been implemented using getrusage(2) instead.
++ Use the `WNOHANG` option on the `waitpid(2)/wait4(2)` system call, and gather data on other running processes in the system (by inspection of `/proc`), with a particular focus on (a) keeping track of all descendents of the child and (b) any files they have open. The latter would be useful for recording provenance automatically (and would be significant mission creep for this program) but potentially also for cleaning up files written by a failed child prior to restarting it (as an option). A third (more paranoid) option is looking for processes run by others in which there is a pattern of command run by the process and failure of a child of childminder. One reason for not implementing this is inconsistent use of `procfs` by different flavours of linux. Another is the computational cost of the overhead.
++ Add a central log file of all calls to `childminder` recording (in CSV format) commands run, which machine, and any results (especially exit status or interrupts, but the `struct rusage` data could also go in here). This could be useful for identifying patterns in resource usage and/or batch job failure. The main reason I didn't implement this already was issues with handling file locking when writing to this file.
