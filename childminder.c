@@ -47,15 +47,18 @@ typedef enum check_signal_status {
  */
 
 #define DEFAULT_LOG_DIR "log"
+#define DEFAULT_N_RESTART 4
 #define SIG_END_ARR 0
-#define CONTINUE_STOPPED 0
-#define RESTART_STOPPED -1
-#define RESTART_SIGNALED -2
-#define NOHANG_SLEEP_NSEC 1000000L
+#define CONTINUE_STOPPED 1
+#define RESTART_STOPPED 2
+#define RESTART_SIGNALED 4
+#define RESTART_EINTR 8
+#define NOHANG_SLEEP_NSEC 10000000L /* 0.01 of a second */
 
 /* procedure declarations
  */
 
+void usage(FILE *fp, const char *cmd);
 void start_child(void);
 void wait_for_child(int secs, void(*func)(void));
 const char *signalstr(int sig);
@@ -68,7 +71,7 @@ void init_signal_arrays(void);
 int check_signal_nok(int sig);
 sig_ck_t check_signal(int sig);
 char *gethostnamenicely(const char *def);
-void math_log_func(void);
+void math_int_func(void);
 void math_double_func(void);
 void string_func(void);
 void file_func(void);
@@ -80,6 +83,7 @@ void random_func(void);
  */
 
 FILE *log_fp = NULL;
+char *log_file = NULL;
 int *signos;
 const char **sigstrs;
 int n_sigs = -1;
@@ -88,6 +92,16 @@ pid_t child_pid;
 char *hostname;
 char * const *cmd_argv;
 int cmd_argc;
+int belligerence;
+int restarts_left;
+int delete_successful;
+int run_ok;
+const char *child_input;
+const char *child_output;
+const char *child_error;
+int no_child;
+int no_child_seconds;
+void (*no_child_func)(void);
 
 /* array of all the signals this system responds to, some of which might
  * be aliases for each other
@@ -325,6 +339,7 @@ const char *all_sigstrs[] = {
 int main(int argc, char * const argv[]) {
   int i;
   const char *log_dir;
+  int *trapped;
 
   pid = getpid();
   hostname = gethostnamenicely("_host-unknown_");
@@ -332,7 +347,16 @@ int main(int argc, char * const argv[]) {
   /* process command-line arguments
    */
 
+  belligerence = 0;
+  delete_successful = 0;
+  no_child = 0;
+  no_child_func = NULL;
+  child_input = NULL;
+  child_output = NULL;
+  child_error = NULL;
+  run_ok = 1;			/* assume it's OK unless we learn otherwise */
   log_dir = DEFAULT_LOG_DIR;
+  restarts_left = DEFAULT_N_RESTART;
   i = 1;
   while(i < argc && argv[i][0] == '-') {
     const char *opt;
@@ -344,6 +368,14 @@ int main(int argc, char * const argv[]) {
     if(strcmp(opt, "--") == 0) {
       break;			/* explicit end of command-line
 				 * options */
+    }
+    else if(strcmp(opt, "-d") == 0 || strcmp(opt, "--delete") == 0) {
+      delete_successful = 1;
+    }
+    else if(strcmp(opt, "-h") == 0 || strcmp(opt, "--help") == 0) {
+				/* help */
+      usage(stdout, argv[0]);
+      return 0;
     }
     else if(strcmp(opt, "-w") == 0 || strcmp(opt, "--working-directory") == 0) {
 				/* change working directory */
@@ -358,32 +390,158 @@ int main(int argc, char * const argv[]) {
       log_dir = argv[i];
       i++;
     }
+    else if(strcmp(opt, "-c") == 0 || strcmp(opt, "--continue") == 0) {
+      belligerence |= CONTINUE_STOPPED;
+    }
+    else if(strcmp(opt, "-p") == 0 || strcmp(opt, "--restart-stopped") == 0) {
+      belligerence |= RESTART_STOPPED;
+    }
+    else if(strcmp(opt, "-r") == 0 || strcmp(opt, "--restart-interrupt") == 0) {
+      belligerence |= RESTART_EINTR;
+    }
+    else if(strcmp(opt, "-s") == 0
+	    || strcmp(opt, "--restart-signalled") == 0) {
+      belligerence |= RESTART_SIGNALED;
+    }
+    else if(strcmp(opt, "-t") == 0 || strcmp(opt, "--n-restarts") == 0) {
+      restarts_left = atoi(argv[i]);
+      i++;
+    }
+    else if(strcmp(opt, "-i") == 0 || strcmp(opt, "--input") == 0) {
+      child_input = argv[i];
+      i++;
+    }
+    else if(strcmp(opt, "-o") == 0 || strcmp(opt, "--output") == 0) {
+      child_output = argv[i];
+      i++;
+    }
+    else if(strcmp(opt, "-e") == 0 || strcmp(opt, "--error") == 0) {
+      child_error = argv[i];
+      i++;
+    }
+    else if(strcmp(opt, "-f") == 0 || strcmp(opt, "--function") == 0) {
+      no_child = 1;
+      no_child_seconds = atoi(argv[i]);
+      i++;
+    }
     else {
       fprintf(stderr, "Option %s not recognized\n", opt);
+      usage(stderr, argv[0]);
       return 1;
     }
+  }
+
+  if(i >= argc) {
+    fprintf(stderr, "You must provide a command as argument\n");
+    usage(stderr, argv[0]);
+    return 1;
   }
   
   cmd_argv = &(argv[i]);
   cmd_argc = argc - i;
 
+  if(no_child) {
+    if(strcmp(argv[i], "math-int") == 0) {
+      no_child_func = math_int_func;
+    }
+    else if(strcmp(argv[i], "math-fp") == 0) {
+      no_child_func = math_double_func;
+    }
+    else if(strcmp(argv[i], "string") == 0) {
+      no_child_func = string_func;
+    }
+    else if(strcmp(argv[i], "file") == 0) {
+      no_child_func = file_func;
+    }
+    else if(strcmp(argv[i], "memory") == 0) {
+      no_child_func = memory_func;
+    }
+    else if(strcmp(argv[i], "random") == 0) {
+      no_child_func = random_func;
+    }
+    else if(strcmp(argv[i], "sleep") != 0) {
+      fprintf(stderr, "Function option not recognized: %s\n", argv[i]);
+      usage(stderr, argv[0]);
+      return 1;
+    }
+  }
+
   init_signal_arrays();
   log_fp = open_log(log_dir, cmd_argv[0]);
 
+  restarts_left++;
   start_child();
     
-  /* parent */
-  trap_everything(sig_handler, NULL);
-  wait_for_child(0, NULL);
+  trapped = trap_everything(sig_handler, NULL);
+
+  log_timestamp();
+  fprintf(log_fp, "trapped");
+  for(i = 0; i < n_sigs; i++) {
+    if(trapped[i]) {
+      fprintf(log_fp, " %s", sigstrs[i]);
+    }
+  }
+  fprintf(log_fp, "\n");
+  
+  wait_for_child(no_child_seconds, no_child_func);
   
   if(log_fp != stdout && log_fp != stderr) {
     fclose(log_fp);
+
+    if(run_ok && delete_successful) {
+      if(unlink(log_file) == -1) {
+	perror(log_file);
+	abort();
+      }
+    }
+    
+    free(log_file);
   }
   free(signos);
   free(sigstrs);
   free(hostname);
-
+  free(trapped);
   return 0;
+}
+
+/* usage()
+ *
+ * Usage summary of this command
+ */
+
+void usage(FILE *fp, const char *cmd) {
+  fprintf(fp, "Usage %s [-c] [-d] [-h] [-r] [-s] [-t] [-e <file>] "
+	  "[-f <seconds>] [-i <file>] [-l <dir>] [-o <file>] [-w <dir>] "
+	  "cmd ...\n", cmd);
+  fprintf(fp, "\t-c (--continue) Attempt to continue the child if it is sent\n"
+	  "\t\ta stop signal\n");
+  fprintf(fp, "\t-d (--delete) Delete log files for runs that terminated\n"
+	  "\t\twith exit status zero\n");
+  fprintf(fp, "\t-e (--error) <file> Redirect child stderr to file\n");
+  fprintf(fp, "\t-f (--function) <seconds> Run a built-in function repeatedly\n"
+	  "\t\tfor the specified number of seconds. If this option is given,\n"
+	  "\t\tthen cmd must be one of \"math-int\", \"math-fp\", \"string\",\n"
+	  "\t\t\"file\", \"memory\", \"random\" or \"sleep\", according to\n"
+	  "\t\tthe operation you want to test on the machine, with random\n"
+	  "\t\tchoosing uniformly among the foregoing options (i.e. not\n"
+	  "\t\t\"sleep\") each function call, and sleep using sleep(3) to\n"
+	  "\t\twait for the specified number of seconds.\n");
+  fprintf(fp, "\t-h (--help) Print this usage message\n");
+  fprintf(fp, "\t-i (--input) <file> Redirect child stdin from file\n");
+  fprintf(fp, "\t-l (--log-directory) <dir> Save log in directory dir (%s by\n"
+	  "\t\tdefault). Use \"stderr\" or \"stdout\" to output log to those\n"
+	  "\t\tstreams\n", DEFAULT_LOG_DIR);
+  fprintf(fp, "\t-o (--output) <file> Redirect child stdout to file\n");
+  fprintf(fp, "\t-p (--restart-stopped) Attempt to restart the child if it is\n"
+	  "\t\tsent a stop signal\n");
+  fprintf(fp, "\t-r (--restart-interrupt) Attempt to restart the child if\n"
+	  "\t\twaitpid(2) returns -1 with EINTR\n");
+  fprintf(fp, "\t-s (--restart-signalled) Attempt to restart the child if it\n"
+	  "\t\tis terminated by a signal\n");
+  fprintf(fp, "\t-t (--n-restart) Maximum number of times to restart the\n"
+	  "\t\tchild (default %d)\n", DEFAULT_N_RESTART);
+  fprintf(fp, "\t-w (--working-directory) <dir> Change directory to dir\n"
+	  "\t\tbefore running cmd\n");
 }
 
 /* start_child()
@@ -392,18 +550,44 @@ int main(int argc, char * const argv[]) {
  */
 
 void start_child(void) {
-  child_pid = fork();
-  if(child_pid == 0) {		/* child */
-    execvp(cmd_argv[0], cmd_argv);
-    perror("execvp failed");
-    abort();
+  if(no_child) return;		/* built-in functions are handled separately */
+  if(restarts_left > 0) {
+    child_pid = fork();
+    if(child_pid == 0) {	/* child */
+      if(child_input != NULL) {
+	if(freopen(child_input, "r", stdin) == NULL) {
+	  perror(child_input);
+	  abort();
+	}
+      }
+      if(child_output != NULL) {
+	if(freopen(child_output, "w", stdout) == NULL) {
+	  perror(child_output);
+	  abort();
+	}
+      }
+      if(child_error != NULL) {
+	if(freopen(child_error, "w", stderr) == NULL) {
+	  perror(child_error);
+	  abort();
+	}
+      }
+      execvp(cmd_argv[0], cmd_argv);
+      perror("execvp failed");
+      abort();
+    }
+    else if(child_pid == -1) {	/* fork failed */
+      perror("fork failed");
+      abort();
+    }
+    log_timestamp();
+    fprintf(log_fp, "child %s started in process %d\n", cmd_argv[0], child_pid);
+    restarts_left--;
   }
-  else if(child_pid == -1) {	/* fork failed */
-    perror("fork failed");
-    abort();
+  else {
+    log_timestamp();
+    fprintf(log_fp, "restarts exhausted\n");
   }
-  log_timestamp();
-  fprintf(log_fp, "child %s started in process %d\n", cmd_argv[0], child_pid);
 }
 
 /* wait_for_child()
@@ -433,6 +617,11 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  perror("waitpid");	/* We weren't interrupted by a signal */
 	  abort();
 	}
+	log_timestamp();
+	fprintf(log_fp, "waitpid(2) returned -1 due to EINTR\n");
+	if(belligerence & RESTART_EINTR) {
+	  start_child();
+	}
 	break;
       case 0:			/* Only returned if WNOHANG in third
 				 * arg to waitpid() */
@@ -457,14 +646,13 @@ void wait_for_child(int secs, void(*func)(void)) {
 #if defined(SIGCONT)
 	  /* attempt to continue the stopped child */
 	  
-	  if(secs < CONTINUE_STOPPED && kill(child_pid, SIGCONT) == -1) {
+	  if((belligerence & CONTINUE_STOPPED)
+	     && kill(child_pid, SIGCONT) == -1) {
 	    keepwaiting = 0;
 
-	    if(secs < RESTART_STOPPED) {
+	    if(belligerence & RESTART_STOPPED) {
 				/* Restart the child */
 	      start_child();
-	      log_timestamp();
-	      fprintf(log_fp, "restarted child in pid %d\n", child_pid);
 	      keepwaiting = 1;
 	    }
 	  
@@ -477,21 +665,21 @@ void wait_for_child(int secs, void(*func)(void)) {
 #else
 	  keepwaiting = 0;
 
-	  if(secs < RESTART_STOPPED) {
+	  if(belligerence & RESTART_STOPPED) {
 				/* Restart the child */
 	    start_child();
-	    log_timestamp();
-	    fprintf(log_fp, "restarted child in pid %d\n", child_pid);
 	    keepwaiting = 1;
 	  }
 
 #endif
+	  run_ok = 0;
 	}
 	else if(WIFEXITED(status)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d exited with status %d\n", child_pid,
 		  WEXITSTATUS(status));
 	  keepwaiting = 0;
+	  run_ok = (WEXITSTATUS(status) == 0) ? 1 : 0;
 	}
 	else if(WIFSIGNALED(status)) {
 	  int signum;
@@ -502,19 +690,19 @@ void wait_for_child(int secs, void(*func)(void)) {
 		  signum, signalstr(signum));
 	  keepwaiting = 0;
 
-	  if(secs < RESTART_SIGNALED) {
+	  if(belligerence & RESTART_SIGNALED) {
 				/* Restart the child */
 	    start_child();
-	    log_timestamp();
-	    fprintf(log_fp, "restarted child in pid %d\n", child_pid);
 	    keepwaiting = 1;
 	  }
+	  run_ok = 0;
 	}
 #ifdef WCOREDUMP
 	else if(WCOREDUMP(status)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d dumped core\n", child_pid);
 	  keepwaiting = 0;
+	  run_ok = 0;
 	}
 #endif
       }
@@ -527,6 +715,11 @@ void wait_for_child(int secs, void(*func)(void)) {
       sleep_secs = (unsigned)secs;
       while(sleep_secs > 0) {
 	sleep_secs = sleep(sleep_secs);
+	if(sleep_secs > 0) {
+	  log_timestamp();
+	  fprintf(log_fp, "sleep interrupted with %u seconds remaining\n",
+		  sleep_secs);
+	}
       }
     }
     else {
@@ -676,7 +869,7 @@ void log_timestamp(void) {
 void sig_handler(int signo, siginfo_t *info, void *context) {
   log_timestamp();
 
-  fprintf(log_fp, "signal %d (%s) ", signo, signalstr(signo));
+  fprintf(log_fp, "signal %d (%s)", signo, signalstr(signo));
 
   if(info != NULL) {
     int print_user_and_process = 1;
@@ -685,32 +878,32 @@ void sig_handler(int signo, siginfo_t *info, void *context) {
 
     switch(info->si_code) {      
     case SI_USER:
-      fprintf(log_fp, "from kill(2)");
+      fprintf(log_fp, " from kill(2)");
       break;
     case SI_QUEUE:
-      fprintf(log_fp, "from sigqueue(3)");
+      fprintf(log_fp, " from sigqueue(3)");
       break;
 #ifdef SI_KERNEL
     case SI_KERNEL:
-      fprintf(log_fp, "from kernel");
+      fprintf(log_fp, " from kernel");
       print_user_and_process = 0;
       break;
 #endif
     case SI_TIMER:
-      fprintf(log_fp, "from POSIX timer expiry");
+      fprintf(log_fp, " from POSIX timer expiry");
       print_user_and_process = 0;
       break;
 #ifdef SI_TKILL
     case SI_TKILL:
-      fprintf(log_fp, "from tkill(2) or tgkill(2)");
+      fprintf(log_fp, " from tkill(2) or tgkill(2)");
       print_user_and_process = 0;
       break;
 #endif
     case SI_MESGQ:
-      fprintf(log_fp, "from message queue state change (see mq_notify (3))");
+      fprintf(log_fp, " from message queue state change (see mq_notify (3))");
       break;
     case SI_ASYNCIO:
-      fprintf(log_fp, "from asynchronous I/O completion");
+      fprintf(log_fp, " from asynchronous I/O completion");
       print_user_and_process = 0;
       break;
     default:
@@ -741,16 +934,19 @@ void sig_handler(int signo, siginfo_t *info, void *context) {
 
       switch(info->si_code) {
       case CLD_EXITED:
-	fprintf(log_fp, "from child exiting");
+	fprintf(log_fp, " from child exiting");
 	break;
       case CLD_KILLED:
-	fprintf(log_fp, "from child dumping core");
+	fprintf(log_fp, " from child dumping core");
+	run_ok = 0;
 	break;
       case CLD_STOPPED:
-	fprintf(log_fp, "from child stopping");
+	fprintf(log_fp, " from child stopping");
+	run_ok = 0;
 	break;
       case CLD_CONTINUED:
-	fprintf(log_fp, "from child continuing");
+	fprintf(log_fp, " from child continuing");
+	run_ok = 1;
 	break;
       }
 
@@ -1067,7 +1263,6 @@ FILE *open_log(const char *log_dir, const char *cmd) {
   }
   else {
     struct stat log_stat;
-    char *log_file = NULL;
     FILE *fp;
 
     if(stat(log_dir, &log_stat) == -1) {
@@ -1104,7 +1299,6 @@ FILE *open_log(const char *log_dir, const char *cmd) {
       perror(log_file);
       abort();
     }
-    free(log_file);
 
     return fp;
   }
@@ -1260,13 +1454,13 @@ char *gethostnamenicely(const char *def) {
 #define FUNC_ITER_MAX 1000
 #define FUNC_TMP_DIR "/var/tmp"
 
-void math_long_func(void) {
+void math_int_func(void) {
   int i;
   long ans;
 
   ans = 0L;
 
-  for(i = 0; i < FUNC_ITER_MAX; i++) {
+  for(i = 0; i < FUNC_ITER_MAX * 102400; i++) {
     ans++;
     ans = ans ^ (long)i;
     ans <<= i & 15;
@@ -1282,9 +1476,9 @@ void math_double_func(void) {
   double ans;
 
   ans = 0.0;
-  for(i = 0; i < FUNC_ITER_MAX; i++) {
-    ans += (double)i;
-    ans = (i % 2) ? (ans / 3.0) : (ans * 5.0);
+  for(i = 0; i < FUNC_ITER_MAX * 102400; i++) {
+    ans += (double)i * (double)i;
+    ans = (i % 2) ? (ans * 2.718281828459045235360287471352662498) : (ans / 3.14159265358979323846264338327950288);
   }
 
   log_timestamp();
@@ -1292,24 +1486,24 @@ void math_double_func(void) {
 }
 
 void string_func(void) {
-  char s[FUNC_ITER_MAX];
+  char s[FUNC_ITER_MAX * 8192];
   int i;
 
-  for(i = 0; i < FUNC_ITER_MAX; i++) {
-    s[i] = '\0' + (char)(i % 126);
-    if(i % 101 == 0 || i == FUNC_ITER_MAX) {
+  for(i = 0; i < FUNC_ITER_MAX * 8192; i++) {
+    s[i] = ' ' + (char)(i % 126);
+    if(i % 101 == 0 || i == FUNC_ITER_MAX * 8192) {
       s[i] = '\0';
     }
   }
 
-  for(i = 0; i < FUNC_ITER_MAX - 4; i++) {
+  for(i = 0; i < (FUNC_ITER_MAX * 8192) - 4; i++) {
     if(strcmp(&(s[i]), "abc") <= 0) {
       strcpy(&(s[i]), "abc");
     }
   }
 
   log_timestamp();
-  fprintf(log_fp, "answer is %s", s);
+  fprintf(log_fp, "answer is %lu\n", strlen(s));
 }
 
 void file_func(void) {
@@ -1319,7 +1513,8 @@ void file_func(void) {
   for(i = 0; i < FUNC_ITER_MAX; i++) {
     char *filename;
 
-    if(asprintf(&filename, "%s/file-%d.txt", FUNC_TMP_DIR, i) >= 0) {
+    if(asprintf(&filename, "%s/file-%d-%d.txt", FUNC_TMP_DIR, (int)pid, i)
+       >= 0) {
       FILE *fp;
 
       fp = fopen(filename, "w");
@@ -1382,7 +1577,7 @@ void random_func(void) {
 
   switch(r % 5) {
   case 0:
-    math_long_func();
+    math_int_func();
   case 1:
     math_double_func();
   case 2:
