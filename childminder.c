@@ -103,6 +103,7 @@ const char *child_error;
 int no_child;
 int no_child_seconds;
 void (*no_child_func)(void);
+struct timeval start_time;
 
 /* array of all the signals this system responds to, some of which might
  * be aliases for each other
@@ -342,6 +343,10 @@ int main(int argc, char * const argv[]) {
   const char *log_dir;
   int *trapped;
 
+  if(gettimeofday(&start_time, NULL) == -1) {
+    perror("gettimeofday");
+    abort();
+  }
   pid = getpid();
   hostname = gethostnamenicely("_host-unknown_");
   
@@ -483,6 +488,7 @@ int main(int argc, char * const argv[]) {
     }
   }
   fprintf(log_fp, "\n");
+  fflush(log_fp);
   
   wait_for_child(no_child_seconds, no_child_func);
   
@@ -583,11 +589,13 @@ void start_child(void) {
     }
     log_timestamp();
     fprintf(log_fp, "child %s started in process %d\n", cmd_argv[0], child_pid);
+    fflush(log_fp);
     restarts_left--;
   }
   else {
     log_timestamp();
     fprintf(log_fp, "restarts exhausted\n");
+    fflush(log_fp);
   }
 }
 
@@ -621,6 +629,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	}
 	log_timestamp();
 	fprintf(log_fp, "waitpid(2) returned -1 due to EINTR\n");
+        fflush(log_fp);
 	if(belligerence & RESTART_EINTR) {
 	  start_child();
 	}
@@ -658,6 +667,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 		  usage.ru_nsignals,
 		  usage.ru_inblock, usage.ru_oublock,
 		  usage.ru_nivcsw, usage.ru_nvcsw);
+          fflush(log_fp);
 	}
 	if(WIFSTOPPED(status)) {
 	  int signum;
@@ -666,6 +676,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d stopped by signal %d (%s)\n", child_pid,
 		  signum, signalstr(signum));
+          fflush(log_fp);
 #if defined(SIGCONT)
 	  /* attempt to continue the stopped child */
 	  
@@ -684,6 +695,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  else {
 	    log_timestamp();
 	    fprintf(log_fp, "successfully sent child %d SIGCONT\n", child_pid);
+            fflush(log_fp);
 	  }
 #else
 	  keepwaiting = 0;
@@ -701,6 +713,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d exited with status %d\n", child_pid,
 		  WEXITSTATUS(status));
+          fflush(log_fp);
 	  keepwaiting = 0;
 	  run_ok = (WEXITSTATUS(status) == 0) ? 1 : 0;
 	}
@@ -711,6 +724,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d terminated by signal %d (%s)\n", child_pid,
 		  signum, signalstr(signum));
+          fflush(log_fp);
 	  keepwaiting = 0;
 
 	  if(belligerence & RESTART_SIGNALED) {
@@ -724,6 +738,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	else if(WCOREDUMP(status)) {
 	  log_timestamp();
 	  fprintf(log_fp, "child %d dumped core\n", child_pid);
+          fflush(log_fp);
 	  keepwaiting = 0;
 	  run_ok = 0;
 	}
@@ -742,6 +757,7 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  log_timestamp();
 	  fprintf(log_fp, "sleep interrupted with %u seconds remaining\n",
 		  sleep_secs);
+          fflush(log_fp);
 	}
       }
     }
@@ -861,9 +877,18 @@ void log_timestamp(void) {
 
   if(gettimeofday(&v, NULL) != -1) {
     if(gmtime_r(&(v.tv_sec), &t) != NULL) {
-      fprintf(log_fp, "%04d%02d%02dT%02d%02d%02d.%06d ", t.tm_year + 1900,
+      long t_sec;
+      int t_usec;
+
+      t_sec = v.tv_sec - start_time.tv_sec;
+      t_usec = v.tv_usec - start_time.tv_usec;
+      if(t_usec < 0) {
+	t_sec--;
+	t_usec += 1000000;
+      }
+      fprintf(log_fp, "%04d%02d%02dT%02d%02d%02d.%06d [+%ld.%06d]", t.tm_year + 1900,
 	      t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec,
-	      (int)v.tv_usec);
+	      (int)v.tv_usec, t_sec, t_usec);
     }
     else {
       fprintf(log_fp, "????????T??????.%06d ", (int)v.tv_usec);
@@ -1212,6 +1237,7 @@ void sig_handler(int signo, siginfo_t *info, void *context) {
 #endif
 
   fprintf(log_fp, "\n");
+  fflush(log_fp);
 }
 
 /* trap_everything()
@@ -1491,7 +1517,8 @@ void math_int_func(void) {
   }
 
   log_timestamp();
-  fprintf(log_fp, "answer is %ld\n", ans);
+  fprintf(log_fp, "(math-int) answer is %ld\n", ans);
+  fflush(log_fp);
 }
 
 void math_double_func(void) {
@@ -1505,7 +1532,8 @@ void math_double_func(void) {
   }
 
   log_timestamp();
-  fprintf(log_fp, "answer is %lf\n", ans);
+  fprintf(log_fp, "(math-fp) answer is %lf\n", ans);
+  fflush(log_fp);
 }
 
 void string_func(void) {
@@ -1526,7 +1554,8 @@ void string_func(void) {
   }
 
   log_timestamp();
-  fprintf(log_fp, "answer is %lu\n", strlen(s));
+  fprintf(log_fp, "(string) answer is %lu\n", strlen(s));
+  fflush(log_fp);
 }
 
 void file_func(void) {
@@ -1565,7 +1594,8 @@ void file_func(void) {
     }
   }
   log_timestamp();
-  fprintf(log_fp, "answer is %d\n", ones);
+  fprintf(log_fp, "(file) answer is %d\n", ones);
+  fflush(log_fp);
 }
 
 void memory_func(void) {
@@ -1590,7 +1620,8 @@ void memory_func(void) {
     }
   }
   log_timestamp();
-  fprintf(log_fp, "answer is %d\n", ans);
+  fprintf(log_fp, "(memory) answer is %d\n", ans);
+  fflush(log_fp);
 }
 
 void random_func(void) {
