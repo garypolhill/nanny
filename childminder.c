@@ -1553,8 +1553,8 @@ void math_int_func(void) {
   if(!quiet_answer) {
     log_timestamp();
     fprintf(log_fp, "(math-int) answer is %ld\n", ans);
+    fflush(log_fp);
   }
-  fflush(log_fp);
 }
 
 void math_double_func(void) {
