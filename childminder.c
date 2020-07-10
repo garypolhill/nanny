@@ -104,6 +104,7 @@ int no_child;
 int no_child_seconds;
 void (*no_child_func)(void);
 struct timeval start_time;
+int quiet_answer;
 
 /* array of all the signals this system responds to, some of which might
  * be aliases for each other
@@ -356,6 +357,7 @@ int main(int argc, char * const argv[]) {
   belligerence = 0;
   delete_successful = 0;
   no_child = 0;
+  quiet_answer = 0;
   no_child_func = NULL;
   child_input = NULL;
   child_output = NULL;
@@ -429,6 +431,9 @@ int main(int argc, char * const argv[]) {
       no_child = 1;
       no_child_seconds = atoi(argv[i]);
       i++;
+    }
+    else if(strcmp(opt, "-q") == 0 || strcmp(opt, "--quiet-func") == 0) {
+      quiet_answer = 1;
     }
     else {
       fprintf(stderr, "Option %s not recognized\n", opt);
@@ -747,6 +752,7 @@ void wait_for_child(int secs, void(*func)(void)) {
     }
   }
   else {
+    struct rusage usage;
     if(func == NULL) {
       unsigned sleep_secs;
 
@@ -764,6 +770,7 @@ void wait_for_child(int secs, void(*func)(void)) {
     else {
       struct timeval v_start;
       int time_elapsed;
+      int n_calls;
 
       if(gettimeofday(&v_start, NULL) == -1) {
 	perror("gettimeofday");
@@ -771,10 +778,12 @@ void wait_for_child(int secs, void(*func)(void)) {
       }
 
       time_elapsed = 0;
+      n_calls = 0;
       do {
 	struct timeval v_end;
 
 	func();
+	n_calls++;
 	if(gettimeofday(&v_end, NULL) != -1) {
 	  if(v_end.tv_sec - v_start.tv_sec > secs
 	     || (v_end.tv_sec - v_start.tv_sec == secs
@@ -783,7 +792,32 @@ void wait_for_child(int secs, void(*func)(void)) {
 	  }
 	}
       } while(!time_elapsed);
+      log_timestamp();
+      fprintf(log_fp, "number of function calls: %d\n", n_calls);
     }
+    if(getrusage(RUSAGE_SELF, &usage) != -1) {
+      log_timestamp();
+      fprintf(log_fp, "rusage info -- system time: %ld.%06ds, "
+	      "user time: %ld.%06ds, memory: %ld%s, minor/major page "
+	      "faults: %ld / %ld, swaps: %ld, signals: %ld, "
+	      "I/O: %ld / %ld, in/voluntary context switches: %ld / %ld"
+	      "\n", 
+	      (long)(usage.ru_stime.tv_sec), usage.ru_stime.tv_usec,
+	      (long)(usage.ru_utime.tv_sec), usage.ru_utime.tv_usec,
+	      usage.ru_maxrss,
+#ifdef __APPLE__
+	      "b",
+#else
+	      "k",
+#endif
+	      usage.ru_minflt, usage.ru_majflt,
+	      usage.ru_nswap,
+	      usage.ru_nsignals,
+	      usage.ru_inblock, usage.ru_oublock,
+	      usage.ru_nivcsw, usage.ru_nvcsw);
+      fflush(log_fp);
+    }
+
   }
 }
 
@@ -1516,8 +1550,10 @@ void math_int_func(void) {
     ans *= 19;
   }
 
-  log_timestamp();
-  fprintf(log_fp, "(math-int) answer is %ld\n", ans);
+  if(!quiet_answer) {
+    log_timestamp();
+    fprintf(log_fp, "(math-int) answer is %ld\n", ans);
+  }
   fflush(log_fp);
 }
 
@@ -1528,12 +1564,15 @@ void math_double_func(void) {
   ans = 0.0;
   for(i = 0; i < FUNC_ITER_MAX * 102400; i++) {
     ans += (double)i * (double)i;
-    ans = (i % 2) ? (ans * 2.718281828459045235360287471352662498) : (ans / 3.14159265358979323846264338327950288);
+    ans = (i % 2) ? (ans * 2.718281828459045235360287471352662498)
+      : (ans / 3.14159265358979323846264338327950288);
   }
 
-  log_timestamp();
-  fprintf(log_fp, "(math-fp) answer is %lf\n", ans);
-  fflush(log_fp);
+  if(!quiet_answer) {
+    log_timestamp();
+    fprintf(log_fp, "(math-fp) answer is %lf\n", ans);
+    fflush(log_fp);
+  }
 }
 
 void string_func(void) {
@@ -1553,9 +1592,11 @@ void string_func(void) {
     }
   }
 
-  log_timestamp();
-  fprintf(log_fp, "(string) answer is %lu\n", strlen(s));
-  fflush(log_fp);
+  if(!quiet_answer) {
+    log_timestamp();
+    fprintf(log_fp, "(string) answer is %lu\n", strlen(s));
+    fflush(log_fp);
+  }
 }
 
 void file_func(void) {
@@ -1593,9 +1634,11 @@ void file_func(void) {
       free(filename);
     }
   }
-  log_timestamp();
-  fprintf(log_fp, "(file) answer is %d\n", ones);
-  fflush(log_fp);
+  if(!quiet_answer) {
+    log_timestamp();
+    fprintf(log_fp, "(file) answer is %d\n", ones);
+    fflush(log_fp);
+  }
 }
 
 void memory_func(void) {
@@ -1619,9 +1662,11 @@ void memory_func(void) {
       free(a);
     }
   }
-  log_timestamp();
-  fprintf(log_fp, "(memory) answer is %d\n", ans);
-  fflush(log_fp);
+  if(!quiet_answer) {
+    log_timestamp();
+    fprintf(log_fp, "(memory) answer is %d\n", ans);
+    fflush(log_fp);
+  }
 }
 
 void random_func(void) {
