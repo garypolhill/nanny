@@ -1385,6 +1385,7 @@ FILE *open_log(const char *log_dir, const char *cmd) {
   else {
     struct stat log_stat;
     FILE *fp;
+    const char *p, *no_slash;
 
     if(stat(log_dir, &log_stat) == -1) {
       if(errno == ENOENT) {
@@ -1408,6 +1409,13 @@ FILE *open_log(const char *log_dir, const char *cmd) {
 	abort();
       }
     }
+
+    no_slash = cmd;
+    no_slash--;
+    for(p = cmd; (*p) != '\0'; p++) {
+      if((*p) == '/') no_slash = p;
+    }
+    no_slash++;
 
     if(asprintf(&log_file, "%s/%s-%s-%06d.txt", log_dir, cmd, hostname, pid)
        < 0) {
