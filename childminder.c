@@ -1334,10 +1334,48 @@ int *trap_everything(void(*handler)(int, siginfo_t *, void *), int *no_block) {
 
 /* open_log()
  *
- * create a log directory and open a log file there
+ * create a log directory and open a log file there -- also, since cmd is
+ * passed as an argument to create a meaningful log file name, check we can
+ * execute it
  */
 
 FILE *open_log(const char *log_dir, const char *cmd) {
+
+  if(access(cmd, R_OK | X_OK) == -1) {
+    if(errno == ENOENT || errno == ENOTDIR) {
+#    if defined(MAXPATHLEN)
+      size_t psz = MAXPATHLEN;
+      char path[MAXPATHLEN];
+#    elif defined(PATH_MAX)
+      size_t psz = PATH_MAX;
+      char path[PATH_MAX];
+#    else
+      size_t psz = 4096;
+      char path[4096];
+#    endif
+
+      if(getcwd(path, psz) == NULL) {
+	fprintf(stderr, "Command %s not found (and current working directory "
+		" not known because \"%s\")\n", cmd, strerror(errno));
+      }
+      else {
+	fprintf(stderr, "Command %s not found from working directory %s\n",
+		cmd, path);
+      }
+    }
+    else if(errno == EACCES) {
+      fprintf(stderr, "Command %s not readable and executable by real user "
+	      "%u (effective user %u)\n", cmd, (unsigned)getuid(),
+	      (unsigned)geteuid());
+    }
+    else {
+      perror(cmd);
+    }
+    abort();
+  }
+
+  
+  
   if(strcmp(log_dir, "stderr") == 0) {
     return stderr;
   }
