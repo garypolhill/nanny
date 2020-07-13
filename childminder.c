@@ -1341,7 +1341,7 @@ int *trap_everything(void(*handler)(int, siginfo_t *, void *), int *no_block) {
 
 FILE *open_log(const char *log_dir, const char *cmd) {
 
-  if(access(cmd, R_OK | X_OK) == -1) {
+  if(!no_child && access(cmd, R_OK | X_OK) == -1) {
     if(errno == ENOENT || errno == ENOTDIR) {
 #    if defined(MAXPATHLEN)
       size_t psz = MAXPATHLEN;
