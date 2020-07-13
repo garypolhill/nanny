@@ -1417,7 +1417,8 @@ FILE *open_log(const char *log_dir, const char *cmd) {
     }
     no_slash++;
 
-    if(asprintf(&log_file, "%s/%s-%s-%06d.txt", log_dir, cmd, hostname, pid)
+    if(asprintf(&log_file, "%s/%s-%s-%06d.txt", log_dir, no_slash, hostname,
+		pid)
        < 0) {
       perror("allocating space for log filename");
       abort();
